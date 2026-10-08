@@ -10,14 +10,12 @@ client-facing behaviour: MCP Authentication is the client-to-gateway half,
 this policy is the gateway-to-upstream half.
 
 Any Identity Provider (IdP) that issues ID-JAGs and any Resource Authorization
-Server (Resource AS) that accepts them work. The diagrams below use this PoC's
-instances, WSO2 Identity Server and Atlassian, as examples.
+Server (Resource AS) that accepts them work. Where the diagrams and examples
+name products (WSO2 Identity Server, Atlassian, Figma, Claude Code) they are
+examples only; nothing in the policy is specific to them.
 
 Written in Go against `github.com/wso2/api-platform/sdk/core` v0.3.5 and
 compiled into the gateway image with the `ap` CLI. Policy version `v0.2.0`.
-This is the code that is deployed and exercised on the PoC gateway; the unit
-suite in `id_jag_test.go` covers both assertion flows end to end against fake
-IdP and Resource AS servers.
 
 ---
 
@@ -34,10 +32,6 @@ three subject token types:
 | OpenID Connect ID token | `urn:ietf:params:oauth:token-type:id_token` | Implementations MUST accept | **Supported**: `assertionType: id_token` |
 | Refresh token | `urn:ietf:params:oauth:token-type:refresh_token` | Optional, "to obtain a new ID-JAG without a new sign-in"; must be bound to the client requesting the ID-JAG | **Supported**: `assertionType: refresh_token` |
 | SAML 2.0 assertion | `urn:ietf:params:oauth:token-type:saml2` | Implementations MUST accept | Not supported, out of scope for this policy |
-
-An **access token is not an identity assertion** and the spec does not allow it
-as the subject. That is the correction over the earlier `gateway-id-jag`
-policy, which sent the inbound access token.
 
 Whichever assertion is used, the rest is the same: the IdP returns an ID-JAG,
 the gateway presents it to the Resource AS in an RFC 7523 JWT-bearer grant, and
@@ -137,8 +131,8 @@ Used by both flows.
   requires every IdP to accept, it costs one IdP call per exchange, and no
   refresh token is ever minted. It needs the client or agent to forward the
   user's ID token, which not every MCP client does.
-- **Refresh token** when only the gateway access token reaches the gateway, as
-  with Claude Code and most off-the-shelf MCP clients. It costs one extra IdP
+- **Refresh token** when only the gateway access token reaches the gateway,
+  which is the case for most off-the-shelf MCP clients. It costs one extra IdP
   call per exchange and depends on the IdP issuing refresh tokens to the
   gateway's client through token exchange.
 
@@ -435,7 +429,6 @@ and [section 4](#4-client-credentials-credentialref).
 │   ├── config.toml          # credential sets, read from the environment
 │   └── policy-attachment.yaml
 ├── docs/                    # flow diagrams (PNG) and their Mermaid sources
-├── CHANGELOG.md
 └── LICENSE                  # Apache 2.0
 ```
 

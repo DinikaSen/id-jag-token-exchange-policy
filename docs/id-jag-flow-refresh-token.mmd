@@ -1,10 +1,10 @@
 sequenceDiagram
     actor User
-    participant Client as Claude Code<br/>(MCP Client)
+    participant Client as MCP client<br/>(e.g. Claude Code)
     participant GW as WSO2 AI Gateway<br/>(MCP Proxy)
-    participant IdP as WSO2 IS<br/>(IdP)
-    participant RAS as Atlassian OAuth<br/>(External RS AS)
-    participant MCP as Atlassian Rovo MCP<br/>(External API)
+    participant IdP as Identity Provider<br/>(e.g. WSO2 Identity Server)
+    participant RAS as Resource Authorization Server<br/>(e.g. Atlassian)
+    participant MCP as Upstream MCP server<br/>(e.g. Atlassian MCP)
 
     rect rgb(255, 250, 225)
         Note over User,MCP: 1. SSO Login
@@ -32,7 +32,7 @@ sequenceDiagram
 
     rect rgb(255, 250, 225)
         Note over User,MCP: 4. Token Exchange for ID-JAG (step 1)
-        GW->>IdP: Token Exchange<br/>(subject_token = Refresh Token,<br/>subject_token_type = refresh_token,<br/>requested_token_type = id-jag,<br/>audience = Atlassian AS issuer,<br/>scope = read + write)
+        GW->>IdP: Token Exchange<br/>(subject_token = Refresh Token,<br/>subject_token_type = refresh_token,<br/>requested_token_type = id-jag,<br/>audience = Resource AS issuer,<br/>scope = read + write)
         IdP->>IdP: Validate refresh token for this client,<br/>resolve user, intersect scope with user roles
         IdP-->>GW: ID-JAG (oauth-id-jag+jwt)<br/>scope narrowed to role
         GW->>GW: Check typ, aud = audience, exp,<br/>requested scope ⊆ ID-JAG scope
@@ -55,7 +55,7 @@ sequenceDiagram
 
     rect rgb(255, 250, 225)
         Note over User,MCP: 7. API Request
-        GW->>MCP: tools/call (with Atlassian access token)
+        GW->>MCP: tools/call (with Resource AS access token)
         MCP-->>GW: Response
         GW-->>Client: Tool result
     end

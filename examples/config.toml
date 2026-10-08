@@ -3,7 +3,7 @@
 #
 # Client credentials are NEVER policy parameters. A policy instance names a set
 # with `credentialRef`; the set is resolved from this list when the API is
-# deployed. One set pairs the gateway's confidential client at the IdP with its
+# deployed to the gateway. One set pairs the gateway's confidential client at the IdP with its
 # confidential client at ONE Resource Authorization Server, so add one table
 # per MCP server the gateway fronts. Names must be unique.
 #
