@@ -1,0 +1,29 @@
+# Excerpt of a WSO2 API Platform gateway build manifest (build.yaml) showing how
+# to compile this policy into a custom gateway image.
+#
+# `filePath` is resolved relative to THIS file, not to the directory `ap` is run
+# from. Put the contents of this repository at ./policies/gateway-id-jag (or add
+# it as a git submodule there) and keep the entry below.
+#
+# gateway.version is only the TAG applied to the built images; it does not
+# select a base image. Bump it on every rebuild so the previous image survives
+# as a rollback target.
+version: v1
+gateway:
+  version: 1.2.0.1
+  images:
+    builder: <registry>/gateway-builder:<base-version>
+    controller: <registry>/gateway-controller:<base-version>
+    runtime: <registry>/gateway-runtime:<base-version>
+policies:
+  # ... the shipped policy set ...
+
+  # Inbound authentication policy that validates the client's bearer token and
+  # sets AuthContext.Authenticated. Any policy that does so works; the stock
+  # mcp-auth / jwt-auth policies are the usual choice.
+  - name: mcp-auth
+    gomodule: github.com/wso2/gateway-controllers/policies/mcp-auth@v1
+
+  # This policy. Local build.
+  - name: gateway-id-jag
+    filePath: ./policies/gateway-id-jag

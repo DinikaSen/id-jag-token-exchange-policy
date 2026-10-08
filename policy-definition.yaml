@@ -1,0 +1,276 @@
+name: gateway-id-jag
+version: v0.1.0
+displayName: Gateway ID-JAG Token
+description: |
+  Exchanges the validated inbound user token for a per-user upstream token via
+  a two-step Identity Assertion JWT Authorization Grant (ID-JAG) flow:
+  (1) RFC 8693 token exchange at the IdP (e.g. WSO2 Identity Server) to obtain an ID-JAG JWT, then
+  (2) JWT-bearer grant at the Resource AS (e.g. Atlassian) to obtain an access token.
+  The final access token is injected into a request header before forwarding.
+  The inbound token is read from the downstream request snapshot (independent of
+  what the inbound auth policy stripped or forwarded), exchanged tokens are cached
+  per inbound token with TTL bounded by both tokens' expiries, and exchange
+  rejections that a fresh sign-in can fix (invalid_grant, interaction_required)
+  are surfaced as 401 with an RFC 9728 resource_metadata pointer so MCP clients
+  re-authenticate; gateway-side faults are 502. Designed to run after an inbound
+  authentication policy such as MCP Auth Passthrough. Fork of gateway-obo-token.
+
+parameters:
+  type: object
+  additionalProperties: false
+  required: ["idpTokenEndpoint", "idpClientId", "idpClientSecret", "resourceAsTokenEndpoint", "resourceAsClientId", "resourceAsClientSecret", "audience"]
+  properties:
+    # ─── Step 1: IdP (identity provider) ───────────────────────────────────
+    idpTokenEndpoint:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        URL of the IdP token endpoint for the RFC 8693 token
+        exchange (step 1).
+    idpClientId:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Client ID of the gateway's confidential app registration at the IdP.
+    idpClientSecret:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Client secret paired with idpClientId. Reference a stored secret,
+        not a raw value.
+    idpClientAuthMethod:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        How client credentials are sent to the IdP token endpoint.
+      enum:
+        - client_secret_basic
+        - client_secret_post
+      default: client_secret_post
+    audience:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Resource AS identifier sent as the audience parameter in the
+        RFC 8693 token exchange (step 1).
+    subjectTokenType:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Token type of the inbound subject token sent in the RFC 8693
+        exchange (step 1).
+      enum:
+        - access_token
+        - id_token
+      default: access_token
+    idpScopes:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Space-separated scopes requested in the IdP token exchange (step 1).
+        Optional; omitted from the request when empty.
+      default: ""
+    idpResource:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Resource parameter for the IdP token exchange (step 1). Optional;
+        omitted from the request when empty.
+      default: ""
+    idpTokenRequestParams:
+      type: object
+      x-wso2-policy-advanced-param: true
+      additionalProperties:
+        type: string
+      description: |
+        Extra form fields merged into the IdP token exchange request (step 1).
+        Cannot override grant_type, subject_token, subject_token_type,
+        requested_token_type, audience, scope, or resource.
+    idpTokenRequestHeaders:
+      type: object
+      x-wso2-policy-advanced-param: true
+      additionalProperties:
+        type: string
+      description: |
+        Extra headers sent with the IdP token exchange request (step 1).
+        Authorization and Content-Type are ignored if set here.
+
+    # ─── Step 2: Resource AS (resource authorization server) ──────────────
+    resourceAsTokenEndpoint:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        URL of the Resource AS token endpoint for the
+        JWT-bearer grant (step 2).
+    resourceAsClientId:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Client ID of the gateway's confidential app registration at the
+        Resource AS.
+    resourceAsClientSecret:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Client secret paired with resourceAsClientId. Reference a stored
+        secret, not a raw value.
+    resourceAsClientAuthMethod:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        How client credentials are sent to the Resource AS token endpoint.
+      enum:
+        - client_secret_basic
+        - client_secret_post
+      default: client_secret_post
+    resourceAsScopes:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Space-separated scopes requested in the Resource AS JWT-bearer
+        grant (step 2). Optional; omitted from the request when empty.
+      default: ""
+    resourceAsTokenRequestParams:
+      type: object
+      x-wso2-policy-advanced-param: true
+      additionalProperties:
+        type: string
+      description: |
+        Extra form fields merged into the Resource AS JWT-bearer request
+        (step 2). Cannot override grant_type, assertion, or scope.
+    resourceAsTokenRequestHeaders:
+      type: object
+      x-wso2-policy-advanced-param: true
+      additionalProperties:
+        type: string
+      description: |
+        Extra headers sent with the Resource AS JWT-bearer request (step 2).
+        Authorization and Content-Type are ignored if set here.
+
+    # ─── Shared / unchanged from OBO ───────────────────────────────────────
+    assertionHeader:
+      type: string
+      x-wso2-policy-advanced-param: true
+      minLength: 1
+      description: |
+        Header in the downstream request snapshot the inbound token
+        (the assertion) is read from. The Bearer scheme prefix is
+        stripped case-insensitively.
+      default: "Authorization"
+    requireAuthContext:
+      type: boolean
+      x-wso2-policy-advanced-param: true
+      description: |
+        Fail closed with 401 when no earlier auth policy validated the
+        inbound token, so this policy can never exchange an unvalidated
+        assertion when attached alone. Disable only for testing.
+      default: true
+    cacheMaxEntries:
+      type: integer
+      x-wso2-policy-advanced-param: true
+      minimum: 1
+      description: |
+        Upper bound on cached (inbound token -> upstream token)
+        entries; the earliest-expiring entry is evicted first.
+      default: 10000
+    challengeResourceMetadata:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Protected resource metadata URL for the resource_metadata
+        parameter of 401 challenges. Empty uses the pointer the MCP
+        Auth Passthrough policy stashes in shared metadata; if that is
+        absent too, the challenge carries no pointer.
+      default: ""
+    userIdClaim:
+      type: string
+      x-wso2-policy-advanced-param: true
+      minLength: 1
+      description: |
+        Claim of the exchanged (upstream) token copied into the auth
+        context's subject for analytics.
+      default: "sub"
+    headerName:
+      type: string
+      x-wso2-policy-advanced-param: true
+      minLength: 1
+      description: |
+        Header the exchanged credential is injected into. Defaults to
+        Authorization.
+      default: "Authorization"
+    valuePrefix:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Prefix prepended to the credential value. Use an empty string
+        for no prefix.
+      default: "Bearer"
+    tokenRequestTimeout:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Timeout for a token-endpoint call (Go duration, e.g. "10s").
+        Applied to both step 1 and step 2.
+      default: "10s"
+    tokenRequestMaxRetries:
+      type: integer
+      x-wso2-policy-advanced-param: true
+      minimum: 0
+      description: |
+        Max retries after a transient token-endpoint failure (network
+        error or 429/5xx). Applied to each step independently. Set 0
+        to disable.
+      default: 2
+    defaultTokenTTL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Fallback token lifetime used when expires_in is omitted (Go
+        duration, e.g. "1h").
+      default: "1h"
+    expiryBuffer:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        How long before expiry a cached token is re-exchanged early
+        (Go duration, e.g. "2m").
+      default: "2m"
+    tokenPurgeStatusCodes:
+      type: array
+      x-wso2-policy-advanced-param: true
+      items:
+        type: integer
+        minimum: 100
+        maximum: 599
+      description: |
+        Upstream status codes that purge the requesting token's cache
+        entry (that entry only). Defaults to [401].
+      default: [401]
+    proxyURL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Proxy URL for token-endpoint calls. Defaults to the standard
+        HTTP_PROXY/HTTPS_PROXY env vars. Applied to both steps.
+      default: ""
+    tlsCaCert:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        PEM CA certificate to trust for the token endpoints' TLS
+        connections. Reference a stored secret, not a raw value.
+      default: ""
+    tlsInsecureSkipVerify:
+      type: boolean
+      x-wso2-policy-advanced-param: true
+      description: |
+        Disables TLS certificate verification for token endpoints.
+        Non-production only.
+      default: false

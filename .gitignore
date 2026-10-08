@@ -1,0 +1,16 @@
+# Build / editor artefacts
+*.test
+*.out
+*.prof
+.idea/
+.vscode/
+.DS_Store
+
+# Never commit credentials or local environment files
+*.pem
+*.key
+*.p12
+*.jks
+*.env
+api-platform.env
+.claude/
