@@ -65,6 +65,15 @@ There is no step 0 and no revocation.
   that header. The sign-in at the IdP therefore has to request the `openid`
   scope so an ID token is issued.
 - The IdP must accept `id_token` as a subject token type for ID-JAG issuance.
+- The ID token's `aud` must include the IdP client ID of the credential set the
+  policy uses (spec section 4.3.3: the IdP checks the assertion's audience
+  against the client authenticating the exchange). When the MCP client signs
+  in with its own client ID, configure the IdP to add the gateway's client ID
+  to that application's ID token audience.
+
+A sample MCP client (web UI and terminal) that implements this contract, keeping the ID
+token from its MCP sign-in and sending it on the header, is at
+[id-jag-sample-mcp-client](https://github.com/DinikaSen/id-jag-sample-mcp-client).
 
 ### 2.2 Refresh token as the assertion (`assertionType: refresh_token`)
 
