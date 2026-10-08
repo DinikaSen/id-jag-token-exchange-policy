@@ -1,0 +1,28 @@
+# Excerpt of the gateway's configs/config.toml: the credential sets this policy
+# reads through its `credentials` system parameter.
+#
+# Client credentials are NEVER policy parameters. A policy instance names a set
+# with `credentialRef`; the set is resolved from this list when the API is
+# deployed. One set pairs the gateway's confidential client at the IdP with its
+# confidential client at ONE Resource Authorization Server, so add one table
+# per MCP server the gateway fronts. Names must be unique.
+#
+# Every value reads the environment (api-platform.env, gitignored, mode 0600).
+# An empty value fails the policy at load time with the field named.
+# Per the ID-JAG profile the IdP client and the Resource AS client are normally
+# the same client identity; set both ids to the same value unless the Resource
+# AS issues its own.
+
+[[policy_configurations.mcp_auth_id_jag_v0.credentials]]
+name                   = "atlassian"
+idpClientId            = '{{ env "APIP_GW_IDJAG_ATLASSIAN_IDP_CLIENT_ID" "" }}'
+idpClientSecret        = '{{ env "APIP_GW_IDJAG_ATLASSIAN_IDP_CLIENT_SECRET" "" }}'
+resourceAsClientId     = '{{ env "APIP_GW_IDJAG_ATLASSIAN_RAS_CLIENT_ID" "" }}'
+resourceAsClientSecret = '{{ env "APIP_GW_IDJAG_ATLASSIAN_RAS_CLIENT_SECRET" "" }}'
+
+[[policy_configurations.mcp_auth_id_jag_v0.credentials]]
+name                   = "figma"
+idpClientId            = '{{ env "APIP_GW_IDJAG_FIGMA_IDP_CLIENT_ID" "" }}'
+idpClientSecret        = '{{ env "APIP_GW_IDJAG_FIGMA_IDP_CLIENT_SECRET" "" }}'
+resourceAsClientId     = '{{ env "APIP_GW_IDJAG_FIGMA_RAS_CLIENT_ID" "" }}'
+resourceAsClientSecret = '{{ env "APIP_GW_IDJAG_FIGMA_RAS_CLIENT_SECRET" "" }}'

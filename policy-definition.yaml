@@ -1,46 +1,88 @@
-name: gateway-id-jag
-version: v0.1.0
-displayName: Gateway ID-JAG Token
+name: mcp-auth-id-jag
+version: v0.2.0
+displayName: MCP Auth ID-JAG
 description: |
-  Exchanges the validated inbound user token for a per-user upstream token via
-  a two-step Identity Assertion JWT Authorization Grant (ID-JAG) flow:
-  (1) RFC 8693 token exchange at the IdP (e.g. WSO2 Identity Server) to obtain an ID-JAG JWT, then
-  (2) JWT-bearer grant at the Resource AS (e.g. Atlassian) to obtain an access token.
-  The final access token is injected into a request header before forwarding.
-  The inbound token is read from the downstream request snapshot (independent of
-  what the inbound auth policy stripped or forwarded), exchanged tokens are cached
-  per inbound token with TTL bounded by both tokens' expiries, and exchange
-  rejections that a fresh sign-in can fix (invalid_grant, interaction_required)
-  are surfaced as 401 with an RFC 9728 resource_metadata pointer so MCP clients
-  re-authenticate; gateway-side faults are 502. Designed to run after an inbound
-  authentication policy such as MCP Auth Passthrough. Fork of gateway-obo-token.
+  Obtains a per-user access token for an upstream MCP server through the
+  Identity Assertion JWT Authorization Grant (ID-JAG) profile
+  (draft-ietf-oauth-identity-assertion-authz-grant):
+  (1) RFC 8693 token exchange at the Identity Provider (IdP) with an identity
+  assertion as the subject token, requesting an ID-JAG for the Resource
+  Authorization Server (Resource AS) named by `audience`; then
+  (2) RFC 7523 JWT-bearer grant at the Resource AS with the ID-JAG as the
+  assertion, yielding the access token that is injected into a request header
+  before forwarding.
+  The assertion is either an ID token carried on a configurable inbound header,
+  or a refresh token the policy first obtains by exchanging the inbound access
+  token at the IdP (same client, so the refresh token is bound to the client
+  that then requests the ID-JAG). Tokens are obtained just in time per request:
+  the ID-JAG and any refresh token are never cached or stored; the final
+  Resource AS access token is cached only when `cacheResourceAccessToken` is on.
+  Client credentials are never policy parameters - they come from the gateway's
+  config.toml / environment as named credential sets selected by `credentialRef`.
+  Runs only after the MCP Authentication policy has validated the client's
+  gateway token (client-to-gateway auth); this policy is the gateway-to-upstream
+  half and has no client-facing behaviour. An IdP rejection of the user's
+  credential (invalid_grant, interaction_required) is a 401; every other
+  failure is a 502.
 
 parameters:
   type: object
   additionalProperties: false
-  required: ["idpTokenEndpoint", "idpClientId", "idpClientSecret", "resourceAsTokenEndpoint", "resourceAsClientId", "resourceAsClientSecret", "audience"]
+  required: ["assertionType", "credentialRef", "idpTokenEndpoint", "audience", "resourceAsTokenEndpoint"]
   properties:
-    # ─── Step 1: IdP (identity provider) ───────────────────────────────────
+    # ─── Assertion source ──────────────────────────────────────────────────
+    assertionType:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        Which identity assertion is presented to the IdP in the ID-JAG token
+        exchange. `id_token`: the inbound request carries the user's ID token
+        on the header named by idTokenHeader. `refresh_token`: the policy first
+        exchanges the inbound access token (from accessTokenHeader) at the IdP
+        for a fresh access token + refresh token, then uses that refresh token
+        as the assertion. The IdP must return a refresh token from that
+        exchange or the request fails with 502.
+      enum:
+        - id_token
+        - refresh_token
+    idTokenHeader:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Header of the inbound request that carries the user's ID token
+        (assertionType = id_token). Read from the downstream request snapshot,
+        so it is seen even if an earlier policy stripped it. A Bearer scheme
+        prefix is tolerated.
+      default: "X-ID-Token"
+    accessTokenHeader:
+      type: string
+      x-wso2-policy-advanced-param: true
+      minLength: 1
+      description: |
+        Header of the inbound request that carries the validated access token
+        exchanged for a refresh token (assertionType = refresh_token). Read
+        from the downstream request snapshot. The Bearer scheme prefix is
+        stripped case-insensitively.
+      default: "Authorization"
+    credentialRef:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Name of the credential set to use, as declared in the gateway's
+        config.toml under [[policy_configurations.mcp_auth_id_jag_v0.credentials]].
+        A set carries the IdP client id/secret and the Resource AS client
+        id/secret. Secrets are never entered here.
+
+    # ─── Identity Provider ─────────────────────────────────────────────────
     idpTokenEndpoint:
       type: string
       x-wso2-policy-advanced-param: false
       minLength: 1
       description: |
-        URL of the IdP token endpoint for the RFC 8693 token
-        exchange (step 1).
-    idpClientId:
-      type: string
-      x-wso2-policy-advanced-param: false
-      minLength: 1
-      description: |
-        Client ID of the gateway's confidential app registration at the IdP.
-    idpClientSecret:
-      type: string
-      x-wso2-policy-advanced-param: false
-      minLength: 1
-      description: |
-        Client secret paired with idpClientId. Reference a stored secret,
-        not a raw value.
+        URL of the IdP token endpoint used for the RFC 8693 token exchange
+        (and, in refresh_token mode, for the preceding access-token exchange).
     idpClientAuthMethod:
       type: string
       x-wso2-policy-advanced-param: true
@@ -55,31 +97,22 @@ parameters:
       x-wso2-policy-advanced-param: false
       minLength: 1
       description: |
-        Resource AS identifier sent as the audience parameter in the
-        RFC 8693 token exchange (step 1).
-    subjectTokenType:
-      type: string
-      x-wso2-policy-advanced-param: true
-      description: |
-        Token type of the inbound subject token sent in the RFC 8693
-        exchange (step 1).
-      enum:
-        - access_token
-        - id_token
-      default: access_token
+        Issuer identifier of the Resource AS, sent as the `audience` of the
+        ID-JAG token exchange and checked against the ID-JAG's `aud` claim.
     idpScopes:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
-        Space-separated scopes requested in the IdP token exchange (step 1).
+        Space-separated scopes requested in the ID-JAG token exchange. The
+        IdP may grant a subset; the granted set is what the ID-JAG carries.
         Optional; omitted from the request when empty.
       default: ""
     idpResource:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
-        Resource parameter for the IdP token exchange (step 1). Optional;
-        omitted from the request when empty.
+        RFC 8707 `resource` parameter for the ID-JAG token exchange
+        (identifier of the Resource Server). Optional; omitted when empty.
       default: ""
     idpTokenRequestParams:
       type: object
@@ -87,7 +120,7 @@ parameters:
       additionalProperties:
         type: string
       description: |
-        Extra form fields merged into the IdP token exchange request (step 1).
+        Extra form fields merged into the ID-JAG token exchange request.
         Cannot override grant_type, subject_token, subject_token_type,
         requested_token_type, audience, scope, or resource.
     idpTokenRequestHeaders:
@@ -96,31 +129,46 @@ parameters:
       additionalProperties:
         type: string
       description: |
-        Extra headers sent with the IdP token exchange request (step 1).
+        Extra headers sent with every IdP token-endpoint request.
         Authorization and Content-Type are ignored if set here.
+    exchangeSubjectTokenType:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        refresh_token mode only. `subject_token_type` the IdP expects for the
+        inbound access token in the access-token exchange that yields the
+        refresh token. `jwt` sends urn:ietf:params:oauth:token-type:jwt,
+        `access_token` sends urn:ietf:params:oauth:token-type:access_token.
+      enum:
+        - jwt
+        - access_token
+      default: jwt
+    exchangeScopes:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        refresh_token mode only. Space-separated scopes requested in the
+        access-token exchange that yields the refresh token. Optional;
+        omitted when empty.
+      default: ""
+    idpRevocationEndpoint:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        refresh_token mode only. RFC 7009 revocation endpoint of the IdP.
+        When set, the refresh token obtained for the exchange is revoked as
+        soon as the ID-JAG has been issued, so no live refresh token is left
+        behind at the IdP. Best effort: a failed revocation is logged, the
+        request still succeeds. Empty disables revocation.
+      default: ""
 
-    # ─── Step 2: Resource AS (resource authorization server) ──────────────
+    # ─── Resource Authorization Server ─────────────────────────────────────
     resourceAsTokenEndpoint:
       type: string
       x-wso2-policy-advanced-param: false
       minLength: 1
       description: |
-        URL of the Resource AS token endpoint for the
-        JWT-bearer grant (step 2).
-    resourceAsClientId:
-      type: string
-      x-wso2-policy-advanced-param: false
-      minLength: 1
-      description: |
-        Client ID of the gateway's confidential app registration at the
-        Resource AS.
-    resourceAsClientSecret:
-      type: string
-      x-wso2-policy-advanced-param: false
-      minLength: 1
-      description: |
-        Client secret paired with resourceAsClientId. Reference a stored
-        secret, not a raw value.
+        URL of the Resource AS token endpoint for the JWT-bearer grant.
     resourceAsClientAuthMethod:
       type: string
       x-wso2-policy-advanced-param: true
@@ -134,8 +182,10 @@ parameters:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
-        Space-separated scopes requested in the Resource AS JWT-bearer
-        grant (step 2). Optional; omitted from the request when empty.
+        Space-separated scopes requested in the JWT-bearer grant. Must be a
+        subset of the scopes the ID-JAG carries; a request outside that set
+        is rejected before it reaches the Resource AS. Optional; omitted
+        when empty, in which case the Resource AS decides from the ID-JAG.
       default: ""
     resourceAsTokenRequestParams:
       type: object
@@ -143,103 +193,41 @@ parameters:
       additionalProperties:
         type: string
       description: |
-        Extra form fields merged into the Resource AS JWT-bearer request
-        (step 2). Cannot override grant_type, assertion, or scope.
+        Extra form fields merged into the JWT-bearer request. Cannot
+        override grant_type, assertion, or scope.
     resourceAsTokenRequestHeaders:
       type: object
       x-wso2-policy-advanced-param: true
       additionalProperties:
         type: string
       description: |
-        Extra headers sent with the Resource AS JWT-bearer request (step 2).
-        Authorization and Content-Type are ignored if set here.
+        Extra headers sent with the JWT-bearer request. Authorization and
+        Content-Type are ignored if set here.
 
-    # ─── Shared / unchanged from OBO ───────────────────────────────────────
-    assertionHeader:
-      type: string
-      x-wso2-policy-advanced-param: true
-      minLength: 1
-      description: |
-        Header in the downstream request snapshot the inbound token
-        (the assertion) is read from. The Bearer scheme prefix is
-        stripped case-insensitively.
-      default: "Authorization"
-    requireAuthContext:
+    # ─── Caching (Resource AS access token only) ───────────────────────────
+    cacheResourceAccessToken:
       type: boolean
-      x-wso2-policy-advanced-param: true
+      x-wso2-policy-advanced-param: false
       description: |
-        Fail closed with 401 when no earlier auth policy validated the
-        inbound token, so this policy can never exchange an unvalidated
-        assertion when attached alone. Disable only for testing.
-      default: true
+        Keep the Resource AS access token in memory, keyed by a hash of the
+        inbound assertion (ID token or access token), until it expires, so
+        later requests from the same user skip the exchange. Off by default:
+        every request then runs the full exchange. The ID-JAG and refresh
+        tokens are never cached regardless of this setting.
+      default: false
     cacheMaxEntries:
       type: integer
       x-wso2-policy-advanced-param: true
       minimum: 1
       description: |
-        Upper bound on cached (inbound token -> upstream token)
-        entries; the earliest-expiring entry is evicted first.
+        Upper bound on cached access tokens when caching is on; the
+        earliest-expiring entry is evicted first.
       default: 10000
-    challengeResourceMetadata:
-      type: string
-      x-wso2-policy-advanced-param: true
-      description: |
-        Protected resource metadata URL for the resource_metadata
-        parameter of 401 challenges. Empty uses the pointer the MCP
-        Auth Passthrough policy stashes in shared metadata; if that is
-        absent too, the challenge carries no pointer.
-      default: ""
-    userIdClaim:
-      type: string
-      x-wso2-policy-advanced-param: true
-      minLength: 1
-      description: |
-        Claim of the exchanged (upstream) token copied into the auth
-        context's subject for analytics.
-      default: "sub"
-    headerName:
-      type: string
-      x-wso2-policy-advanced-param: true
-      minLength: 1
-      description: |
-        Header the exchanged credential is injected into. Defaults to
-        Authorization.
-      default: "Authorization"
-    valuePrefix:
-      type: string
-      x-wso2-policy-advanced-param: true
-      description: |
-        Prefix prepended to the credential value. Use an empty string
-        for no prefix.
-      default: "Bearer"
-    tokenRequestTimeout:
-      type: string
-      x-wso2-policy-advanced-param: true
-      description: |
-        Timeout for a token-endpoint call (Go duration, e.g. "10s").
-        Applied to both step 1 and step 2.
-      default: "10s"
-    tokenRequestMaxRetries:
-      type: integer
-      x-wso2-policy-advanced-param: true
-      minimum: 0
-      description: |
-        Max retries after a transient token-endpoint failure (network
-        error or 429/5xx). Applied to each step independently. Set 0
-        to disable.
-      default: 2
-    defaultTokenTTL:
-      type: string
-      x-wso2-policy-advanced-param: true
-      description: |
-        Fallback token lifetime used when expires_in is omitted (Go
-        duration, e.g. "1h").
-      default: "1h"
     expiryBuffer:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
-        How long before expiry a cached token is re-exchanged early
+        How long before expiry a cached access token is re-exchanged early
         (Go duration, e.g. "2m").
       default: "2m"
     tokenPurgeStatusCodes:
@@ -250,15 +238,54 @@ parameters:
         minimum: 100
         maximum: 599
       description: |
-        Upstream status codes that purge the requesting token's cache
-        entry (that entry only). Defaults to [401].
+        Upstream status codes that purge the requesting user's cached access
+        token (that entry only). Only meaningful when caching is on.
+        Defaults to [401].
       default: [401]
+
+    # ─── Shared ────────────────────────────────────────────────────────────
+    headerName:
+      type: string
+      x-wso2-policy-advanced-param: true
+      minLength: 1
+      description: |
+        Header the Resource AS access token is injected into.
+      default: "Authorization"
+    valuePrefix:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Prefix prepended to the injected value. Use an empty string for no
+        prefix.
+      default: "Bearer"
+    tokenRequestTimeout:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Timeout for one token-endpoint call (Go duration, e.g. "10s").
+        Applied to every step.
+      default: "10s"
+    tokenRequestMaxRetries:
+      type: integer
+      x-wso2-policy-advanced-param: true
+      minimum: 0
+      description: |
+        Max retries after a transient token-endpoint failure (network error
+        or 429/5xx). Applied to each step independently. Set 0 to disable.
+      default: 2
+    defaultTokenTTL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Fallback lifetime for a Resource AS access token whose response
+        omits expires_in (Go duration, e.g. "1h"). Only used by the cache.
+      default: "1h"
     proxyURL:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
         Proxy URL for token-endpoint calls. Defaults to the standard
-        HTTP_PROXY/HTTPS_PROXY env vars. Applied to both steps.
+        HTTP_PROXY/HTTPS_PROXY env vars.
       default: ""
     tlsCaCert:
       type: string
@@ -274,3 +301,47 @@ parameters:
         Disables TLS certificate verification for token endpoints.
         Non-production only.
       default: false
+
+# Gateway-wide configuration, never shown or editable per API. Resolved from
+# config.toml at policy load time; config.toml in turn reads each secret from
+# the environment (api-platform.env), so no secret is ever written to disk in
+# clear text by the platform.
+systemParameters:
+  type: object
+  additionalProperties: false
+  properties:
+    credentials:
+      type: array
+      description: |
+        Named credential sets. A policy instance selects one by
+        `credentialRef`. Each set pairs the gateway's confidential client at
+        the IdP with its confidential client at one Resource AS.
+      "wso2/defaultValue": "${config.policy_configurations.mcp_auth_id_jag_v0.credentials}"
+      items:
+        type: object
+        additionalProperties: false
+        required: ["name", "idpClientId", "idpClientSecret", "resourceAsClientId", "resourceAsClientSecret"]
+        properties:
+          name:
+            type: string
+            minLength: 1
+            description: Unique name referenced by a policy instance's credentialRef.
+          idpClientId:
+            type: string
+            minLength: 1
+            description: Client ID of the gateway's confidential app at the IdP.
+          idpClientSecret:
+            type: string
+            minLength: 1
+            description: Client secret paired with idpClientId.
+          resourceAsClientId:
+            type: string
+            minLength: 1
+            description: |
+              Client ID of the gateway's confidential app at the Resource AS.
+              Per the ID-JAG profile this must identify the same client as the
+              ID-JAG's client_id claim, i.e. the IdP client.
+          resourceAsClientSecret:
+            type: string
+            minLength: 1
+            description: Client secret paired with resourceAsClientId.

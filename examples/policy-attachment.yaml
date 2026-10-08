@@ -1,11 +1,13 @@
-# Example of attaching gateway-id-jag to a gateway API artifact.
+# Example of attaching mcp-auth-id-jag to a gateway MCP proxy artifact.
 #
-# Policy order matters: an inbound authentication policy MUST run first so that
-# AuthContext.Authenticated is set; gateway-id-jag fails closed with 401
-# otherwise (requireAuthContext defaults to true).
+# Policy order matters: MCP Authentication MUST run first. It validates the
+# client's gateway token (client-to-gateway auth) and sets the auth context;
+# mcp-auth-id-jag then performs the gateway-to-upstream ID-JAG exchange.
+# A request that reaches mcp-auth-id-jag unauthenticated is rejected.
 #
-# All values below are placeholders. Never commit real client secrets: reference
-# a secret stored in the gateway / control plane instead of a literal value.
+# No client secret appears here. Credentials come from the credential set named
+# by credentialRef, declared in the gateway's config.toml (examples/config.toml).
+# All other values below are placeholders.
 apiVersion: gateway.api-platform.wso2.com/v1
 kind: McpProxy            # or the API kind your gateway version uses
 metadata:
@@ -14,43 +16,52 @@ spec:
   context: /default/example-mcp-proxy
   displayName: Example MCP Proxy
   globalPolicies:
-    # 1. Validate the inbound token (gateway-issued, from the IdP).
+    # 1. Client-to-gateway: validate the inbound gateway token.
     - name: mcp-auth
       version: v1
       params:
         # ...issuer / JWKS / audience settings for your IdP...
 
-    # 2. Exchange it for a per-user upstream token and inject it.
-    - name: gateway-id-jag
+    # 2. Gateway-to-upstream: exchange it for a per-user upstream token.
+    - name: mcp-auth-id-jag
       version: v0
       params:
-        # ─── Step 1: identity provider (RFC 8693 token exchange) ───
+        # ─── Assertion ───
+        # refresh_token: the client sends only the gateway access token; the
+        #   policy obtains a refresh token for its own IdP client (step 0) and
+        #   presents it as the assertion.
+        # id_token: the client also sends the user's ID token on idTokenHeader.
+        assertionType: refresh_token
+        # idTokenHeader: X-ID-Token             # id_token flow only
+        # accessTokenHeader: Authorization      # refresh_token flow, default
+        # exchangeSubjectTokenType: jwt         # refresh_token flow: jwt | access_token
+        # exchangeScopes: ""                    # refresh_token flow, optional
+
+        # ─── Credentials (see examples/config.toml) ───
+        credentialRef: atlassian
+
+        # ─── Identity provider ───
         idpTokenEndpoint: https://idp.example.com/oauth2/token
-        idpClientId: <gateway-app-client-id-at-idp>
-        idpClientSecret: <reference-to-stored-secret>
+        idpRevocationEndpoint: https://idp.example.com/oauth2/revoke   # refresh_token flow, optional: revoke after use
         idpClientAuthMethod: client_secret_basic   # WSO2 IS rejects body creds + Basic together
-        audience: https://auth.resource.example.com # the Resource AS identifier
-        subjectTokenType: id_token                  # id_token when the IdP is WSO2 IS
+        audience: https://auth.resource.example.com # the Resource AS issuer identifier
         idpScopes: "read write"                     # optional
-        # idpResource: https://auth.resource.example.com   # optional, some IdPs want this too
+        # idpResource: https://auth.resource.example.com   # optional, RFC 8707
 
-        # ─── Step 2: resource authorization server (JWT-bearer grant) ───
+        # ─── Resource authorization server ───
         resourceAsTokenEndpoint: https://auth.resource.example.com/oauth/token
-        resourceAsClientId: <gateway-app-client-id-at-resource-as>
-        resourceAsClientSecret: <reference-to-stored-secret>
         resourceAsClientAuthMethod: client_secret_post
-        resourceAsScopes: "read:example write:example"   # optional
+        resourceAsScopes: "read:example write:example"   # optional, must be within the ID-JAG scope
 
-        # ─── Shared (all optional, defaults shown) ───
-        assertionHeader: Authorization
-        requireAuthContext: true
+        # ─── Cache (off by default; the ID-JAG and refresh token are never cached) ───
+        cacheResourceAccessToken: false
+        # cacheMaxEntries: 10000
+        # expiryBuffer: 2m
+        # tokenPurgeStatusCodes: [401]
+
+        # ─── Injection and transport (defaults shown) ───
         headerName: Authorization
         valuePrefix: Bearer
         tokenRequestTimeout: 10s
         tokenRequestMaxRetries: 2
         defaultTokenTTL: 1h
-        expiryBuffer: 2m
-        cacheMaxEntries: 10000
-        tokenPurgeStatusCodes: [401]
-        userIdClaim: sub
-        # challengeResourceMetadata: https://gateway.example.com/default/example-mcp-proxy/.well-known/oauth-protected-resource

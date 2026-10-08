@@ -15,11 +15,11 @@
  *
  */
 
-// Token-endpoint HTTP plumbing, forked from gateway-obo-token/token_request.go.
-// The per-policy-instance token sources are gone - ID-JAG tokens are
-// per-assertion, cached in id_jag_cache.go - but the request/response handling,
-// retry classification, and transport registry are kept as-is.
-package oauth2idjag
+// Token-endpoint HTTP plumbing: one POST helper shared by every step, an RFC
+// 7009 revocation helper, bounded retry with jittered backoff, a process-wide
+// transport registry keyed by proxy/TLS configuration, logging hygiene, and
+// the parameter accessors.
+package mcpauthidjag
 
 import (
 	"context"
@@ -40,16 +40,16 @@ import (
 )
 
 const (
-	// defaultTokenRequestTimeout bounds a token-endpoint HTTP call so a hung IdP can't block indefinitely.
+	// defaultTokenRequestTimeout bounds a token-endpoint HTTP call so a hung server can't block indefinitely.
 	defaultTokenRequestTimeout = 10 * time.Second
 
-	// defaultTokenTTLFallback is used when the token response omits expires_in.
+	// defaultTokenTTLFallback is used when a cacheable token response omits expires_in.
 	defaultTokenTTLFallback = time.Hour
 
-	// defaultHeaderName is the header the exchanged credential is injected into when headerName is omitted.
+	// defaultHeaderName is the header the Resource AS access token is injected into when headerName is omitted.
 	defaultHeaderName = "Authorization"
 
-	// defaultValuePrefix is prepended to the credential value when valuePrefix is omitted; an
+	// defaultValuePrefix is prepended to the injected value when valuePrefix is omitted; an
 	// explicitly configured empty string is honored as "no prefix".
 	defaultValuePrefix = "Bearer"
 
@@ -57,30 +57,38 @@ const (
 	defaultTokenRequestMaxRetries = 2
 
 	// retryBaseDelay/retryMaxDelay bound fetchWithRetry's exponential backoff, with jitter
-	// so replicas don't retry a struggling IdP in lockstep.
+	// so replicas don't retry a struggling server in lockstep.
 	retryBaseDelay = 100 * time.Millisecond
 	retryMaxDelay  = 2 * time.Second
 
 	// maxTokenResponseBytes bounds how much of a token response is read, regardless of
-	// Content-Length, so a misbehaving IdP can't exhaust memory.
+	// Content-Length, so a misbehaving server can't exhaust memory.
 	maxTokenResponseBytes = 1 << 20 // 1MiB
+
+	// revocationTimeout bounds the best-effort refresh-token revocation that runs after the
+	// ID-JAG is issued; it is detached from the request context so a client disconnect never
+	// leaves a live refresh token behind.
+	revocationTimeout = 5 * time.Second
 )
 
 // defaultPurgeStatusCodes is applied when tokenPurgeStatusCodes is omitted. 401 is the standard
 // signal (RFC 6750 §3) that a bearer token was rejected as invalid.
 var defaultPurgeStatusCodes = []int{http.StatusUnauthorized}
 
-// Token is the subset of an RFC 6749 §5.1 token response this policy needs.
+// Token is the subset of an RFC 6749 §5.1 / RFC 8693 §2.2.1 token response the policy needs.
+// For the ID-JAG exchange AccessToken carries the ID-JAG itself (the profile reuses the field).
 type Token struct {
-	AccessToken  string
-	TokenType    string
-	RefreshToken string
-	Expiry       time.Time
+	AccessToken     string
+	TokenType       string
+	RefreshToken    string
+	IssuedTokenType string
+	Scope           string
+	Expiry          time.Time
 }
 
 // TokenError represents an RFC 6749 §5.2 error response FROM the token endpoint, as opposed to a
-// network-level failure that never got a response at all. CorrelationID carries the IdP's
-// correlation_id when present, for log correlation with the IdP side.
+// network-level failure that never got a response at all. CorrelationID carries the server's
+// correlation_id when present, for log correlation with the other side.
 type TokenError struct {
 	StatusCode       int
 	ErrorCode        string
@@ -126,13 +134,22 @@ func authStyleFor(method string) clientAuthStyle {
 	return authStyleInParams
 }
 
-// tokenJSON is the raw shape of an RFC 6749 §5.1 token response. ExpiresIn is left as
-// json.RawMessage since some IdPs send it as a JSON string instead of a number.
+// clientCredential is one confidential-client registration plus how it authenticates.
+type clientCredential struct {
+	id     string
+	secret string
+	style  clientAuthStyle
+}
+
+// tokenJSON is the raw shape of a token response. ExpiresIn is left as json.RawMessage since
+// some servers send it as a JSON string instead of a number.
 type tokenJSON struct {
-	AccessToken  string          `json:"access_token"`
-	TokenType    string          `json:"token_type"`
-	RefreshToken string          `json:"refresh_token"`
-	ExpiresIn    json.RawMessage `json:"expires_in"`
+	AccessToken     string          `json:"access_token"`
+	TokenType       string          `json:"token_type"`
+	RefreshToken    string          `json:"refresh_token"`
+	IssuedTokenType string          `json:"issued_token_type"`
+	Scope           string          `json:"scope"`
+	ExpiresIn       json.RawMessage `json:"expires_in"`
 }
 
 func (t tokenJSON) expiresInSeconds() (int64, bool) {
@@ -152,61 +169,20 @@ func (t tokenJSON) expiresInSeconds() (int64, bool) {
 	return 0, false
 }
 
-// doTokenRequest POSTs form to tokenEndpoint and parses the response. style selects how the
+// doTokenRequest POSTs form to tokenEndpoint and parses the response. cred selects how the
 // client authenticates (HTTP Basic header vs client_id/client_secret form fields); extraHeaders
 // is applied last, skipping Authorization/Content-Type so it can never override them.
-// clientID/clientSecret are form-urlencoded before being combined into the Basic credential
+// id/secret are form-urlencoded before being combined into the Basic credential
 // (RFC 6749 Appendix B) - a raw base64(id+":"+secret) would mishandle a colon in either value.
-func doTokenRequest(ctx context.Context, httpClient *http.Client, tokenEndpoint string, style clientAuthStyle,
-	clientID, clientSecret string, form url.Values, extraHeaders map[string]string) (*Token, error) {
-	if style == authStyleInParams {
-		form.Set("client_id", clientID)
-		form.Set("client_secret", clientSecret)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(form.Encode()))
+func doTokenRequest(ctx context.Context, httpClient *http.Client, tokenEndpoint string, cred clientCredential,
+	form url.Values, extraHeaders map[string]string) (*Token, error) {
+	resp, body, err := postForm(ctx, httpClient, tokenEndpoint, cred, form, extraHeaders)
 	if err != nil {
-		return nil, fmt.Errorf("build token request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	for k, v := range extraHeaders {
-		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Content-Type") {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-	if style == authStyleInHeader {
-		req.SetBasicAuth(url.QueryEscape(clientID), url.QueryEscape(clientSecret))
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("token request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading token response: %w", err)
-	}
-	if len(body) > maxTokenResponseBytes {
-		return nil, fmt.Errorf("token response exceeded %d bytes", maxTokenResponseBytes)
+		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		tokErr := &TokenError{StatusCode: resp.StatusCode}
-		var errBody struct {
-			Error            string `json:"error"`
-			ErrorDescription string `json:"error_description"`
-			CorrelationID    string `json:"correlation_id"`
-		}
-		if json.Unmarshal(body, &errBody) == nil {
-			tokErr.ErrorCode = errBody.Error
-			tokErr.ErrorDescription = errBody.ErrorDescription
-			tokErr.CorrelationID = errBody.CorrelationID
-		}
-		return nil, tokErr
+		return nil, tokenErrorFrom(resp.StatusCode, body)
 	}
 
 	var parsed tokenJSON
@@ -218,12 +194,11 @@ func doTokenRequest(ctx context.Context, httpClient *http.Client, tokenEndpoint 
 	}
 
 	tok := &Token{
-		AccessToken:  parsed.AccessToken,
-		TokenType:    parsed.TokenType,
-		RefreshToken: parsed.RefreshToken,
-	}
-	if tok.TokenType == "" {
-		tok.TokenType = "Bearer"
+		AccessToken:     parsed.AccessToken,
+		TokenType:       parsed.TokenType,
+		RefreshToken:    parsed.RefreshToken,
+		IssuedTokenType: parsed.IssuedTokenType,
+		Scope:           strings.TrimSpace(parsed.Scope),
 	}
 	if secs, ok := parsed.expiresInSeconds(); ok {
 		tok.Expiry = time.Now().Add(time.Duration(secs) * time.Second)
@@ -231,9 +206,85 @@ func doTokenRequest(ctx context.Context, httpClient *http.Client, tokenEndpoint 
 	return tok, nil
 }
 
-// fetchWithRetry runs fetch with bounded retry for transient failures - the same
-// classification and backoff as oauth2-generator's resilientTokenSource, minus its
-// single-flighting (flightGroup already guarantees one sequence per cache key).
+// doRevocationRequest POSTs an RFC 7009 revocation for token. The server answers 200 whether or
+// not the token was valid; anything else is reported so the caller can log it. Never retried:
+// it is best effort and runs after the response-critical work is done.
+func doRevocationRequest(ctx context.Context, httpClient *http.Client, revocationEndpoint string,
+	cred clientCredential, token, tokenTypeHint string, extraHeaders map[string]string) error {
+	form := url.Values{}
+	form.Set("token", token)
+	if tokenTypeHint != "" {
+		form.Set("token_type_hint", tokenTypeHint)
+	}
+	resp, body, err := postForm(ctx, httpClient, revocationEndpoint, cred, form, extraHeaders)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return tokenErrorFrom(resp.StatusCode, body)
+	}
+	return nil
+}
+
+// postForm sends one form-encoded POST with client authentication and returns the response
+// plus its (bounded) body.
+func postForm(ctx context.Context, httpClient *http.Client, endpoint string, cred clientCredential,
+	form url.Values, extraHeaders map[string]string) (*http.Response, []byte, error) {
+	if cred.style == authStyleInParams {
+		form.Set("client_id", cred.id)
+		form.Set("client_secret", cred.secret)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	for k, v := range extraHeaders {
+		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Content-Type") {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+	if cred.style == authStyleInHeader {
+		req.SetBasicAuth(url.QueryEscape(cred.id), url.QueryEscape(cred.secret))
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("token request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseBytes+1))
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading token response: %w", err)
+	}
+	if len(body) > maxTokenResponseBytes {
+		return nil, nil, fmt.Errorf("token response exceeded %d bytes", maxTokenResponseBytes)
+	}
+	return resp, body, nil
+}
+
+// tokenErrorFrom builds a *TokenError from a non-200 token-endpoint response, reading the RFC
+// 6749 §5.2 fields when the body is JSON.
+func tokenErrorFrom(status int, body []byte) *TokenError {
+	tokErr := &TokenError{StatusCode: status}
+	var errBody struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+		CorrelationID    string `json:"correlation_id"`
+	}
+	if json.Unmarshal(body, &errBody) == nil {
+		tokErr.ErrorCode = errBody.Error
+		tokErr.ErrorDescription = errBody.ErrorDescription
+		tokErr.CorrelationID = errBody.CorrelationID
+	}
+	return tokErr
+}
+
+// fetchWithRetry runs fetch with bounded retry for transient failures.
 func fetchWithRetry(ctx context.Context, maxRetries int, fetch func(ctx context.Context) (*Token, error)) (*Token, error) {
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -259,7 +310,7 @@ func fetchWithRetry(ctx context.Context, maxRetries int, fetch func(ctx context.
 // isRetryableTokenError classifies a token-fetch error as worth retrying. A *nonRetryableTokenError
 // (malformed/incomplete response body) never succeeds by retrying unchanged. A *TokenError is only
 // retryable on 429/5xx. Any other error (network failure, request build failure) didn't get a
-// definitive rejection from the IdP and is retried by default.
+// definitive rejection and is retried by default.
 func isRetryableTokenError(err error) bool {
 	var nonRetryable *nonRetryableTokenError
 	if errors.As(err, &nonRetryable) {
@@ -335,15 +386,9 @@ var tokenEndpointTransports = newKeyedSingleton[tokenEndpointTransportKey, *http
 
 // getOrCreateTokenEndpointTransport returns the process-wide shared Transport for this
 // proxy/TLS configuration, building it on first use.
-func getOrCreateTokenEndpointTransport(p idJagParams) (*http.Transport, error) {
-	key := tokenEndpointTransportKey{
-		proxyURL:              p.proxyURL,
-		tlsCACert:             p.tlsCaCert,
-		tlsInsecureSkipVerify: p.tlsInsecureSkipVerify,
-	}
-
+func getOrCreateTokenEndpointTransport(key tokenEndpointTransportKey) (*http.Transport, error) {
 	transport, _, err := tokenEndpointTransports.getOrCreate(key, func() (*http.Transport, error) {
-		return buildTokenEndpointTransport(p)
+		return buildTokenEndpointTransport(key)
 	})
 	return transport, err
 }
@@ -351,10 +396,10 @@ func getOrCreateTokenEndpointTransport(p idJagParams) (*http.Transport, error) {
 // buildTokenEndpointTransport wires proxyURL and TLS settings into one Transport, setting Proxy
 // explicitly alongside TLSClientConfig - an unset Transport.Proxy means "never proxy", it does
 // not fall back to ProxyFromEnvironment.
-func buildTokenEndpointTransport(p idJagParams) (*http.Transport, error) {
+func buildTokenEndpointTransport(key tokenEndpointTransportKey) (*http.Transport, error) {
 	proxyFunc := http.ProxyFromEnvironment
-	if p.proxyURL != "" {
-		proxyURL, err := url.Parse(p.proxyURL)
+	if key.proxyURL != "" {
+		proxyURL, err := url.Parse(key.proxyURL)
 		if err != nil {
 			// url.Error embeds the raw input verbatim, which could leak proxyURL's userinfo - scrub before wrapping.
 			return nil, fmt.Errorf("invalid proxyURL: %s", redactURLCredentials(err.Error()))
@@ -364,10 +409,10 @@ func buildTokenEndpointTransport(p idJagParams) (*http.Transport, error) {
 
 	transport := &http.Transport{Proxy: proxyFunc}
 
-	if p.tlsCaCert != "" || p.tlsInsecureSkipVerify {
-		tlsConfig := &tls.Config{InsecureSkipVerify: p.tlsInsecureSkipVerify} //nolint:gosec // opt-in, logged at extraction time
-		if p.tlsCaCert != "" {
-			pool, err := parseCACertPool(p.tlsCaCert)
+	if key.tlsCACert != "" || key.tlsInsecureSkipVerify {
+		tlsConfig := &tls.Config{InsecureSkipVerify: key.tlsInsecureSkipVerify} //nolint:gosec // opt-in, logged at extraction time
+		if key.tlsCACert != "" {
+			pool, err := parseCACertPool(key.tlsCACert)
 			if err != nil {
 				return nil, fmt.Errorf("tlsCaCert: %w", err)
 			}
@@ -402,7 +447,7 @@ func redactURLCredentials(s string) string {
 }
 
 // sanitizeEndpointForLogging reduces an operator-configured endpoint URL to scheme+host+path
-// before it's logged, since tokenEndpoint is user configuration and can carry sensitive URL
+// before it's logged, since an endpoint is user configuration and can carry sensitive URL
 // components. Falls back to a fixed placeholder rather than log the raw value when it doesn't
 // even parse as a URL.
 func sanitizeEndpointForLogging(raw string) string {
@@ -425,10 +470,19 @@ func buildHeaderValue(prefix, token string) string {
 	return prefix + " " + token
 }
 
-// ─── Param helpers (unchanged from oauth2-generator) ──────────────────────────
+// cloneURLValues copies form values so a retry never observes a mutated map.
+func cloneURLValues(v url.Values) url.Values {
+	out := make(url.Values, len(v))
+	for k, vals := range v {
+		out[k] = append([]string(nil), vals...)
+	}
+	return out
+}
+
+// ─── Param helpers ────────────────────────────────────────────────────────────
 
 // getStringParam safely extracts a string parameter, returning "" if absent or the wrong type.
-// Leading/trailing whitespace is trimmed since pasted credentials often carry a stray newline.
+// Leading/trailing whitespace is trimmed since pasted values often carry a stray newline.
 func getStringParam(params map[string]interface{}, key string) string {
 	if val, ok := params[key]; ok {
 		if str, ok := val.(string); ok {
@@ -467,6 +521,29 @@ func getRequiredStringParam(params map[string]interface{}, key string) (string, 
 		return "", fmt.Errorf("'%s' cannot be empty", key)
 	}
 	return str, nil
+}
+
+// getEnumParam extracts an optional string parameter that must be one of allowed, falling back
+// to def when absent or empty.
+func getEnumParam(params map[string]interface{}, key, def string, allowed ...string) (string, error) {
+	v := getStringParam(params, key)
+	if v == "" {
+		v = def
+	}
+	for _, a := range allowed {
+		if v == a {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("'%s' must be one of %s", key, strings.Join(quoteAll(allowed), ", "))
+}
+
+func quoteAll(ss []string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = strconv.Quote(s)
+	}
+	return out
 }
 
 // getBoolParam extracts an optional boolean parameter, falling back to def if absent or the wrong type.
