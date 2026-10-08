@@ -25,7 +25,27 @@ compiled into the gateway image with the `ap` CLI. Policy version `v0.1.0`.
 
 ## Flow
 
-![ID-JAG flow](docs/id-jag-flow.png)
+Two assertion types are supported. In both, MCP Authentication validates the
+client's gateway token first; this policy then runs the exchange toward the
+upstream. WSO2 Identity Server and Atlassian are this PoC's instances of the
+IdP and Resource AS; any pair that implements ID-JAG works.
+
+### ID token as the assertion (`assertionType: id_token`)
+
+The client sends the user's ID token on a configurable header alongside the
+gateway access token.
+
+![ID-JAG flow with an ID token assertion](docs/id-jag-flow-id-token.png)
+
+### Refresh token as the assertion (`assertionType: refresh_token`)
+
+The client sends only the gateway access token. The gateway first exchanges it
+for a refresh token bound to its own IdP client, presents that as the
+assertion, and revokes it afterwards.
+
+![ID-JAG flow with a refresh token assertion](docs/id-jag-flow-refresh-token.png)
+
+Both diagrams are generated from the Mermaid sources next to them in `docs/`.
 
 ## What the policy does
 

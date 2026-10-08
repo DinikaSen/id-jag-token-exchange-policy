@@ -1,0 +1,48 @@
+sequenceDiagram
+    actor User
+    participant Client as Claude Code<br/>(MCP Client)
+    participant GW as WSO2 AI Gateway<br/>(MCP Proxy)
+    participant IdP as WSO2 IS<br/>(IdP)
+    participant RAS as Atlassian OAuth<br/>(External RS AS)
+    participant MCP as Atlassian Rovo MCP<br/>(External API)
+
+    rect rgb(255, 250, 225)
+        Note over User,MCP: 1. SSO Login
+        User->>Client: Launch & authenticate
+        Client->>GW: MCP request (no token)
+        GW-->>Client: 401 + WWW-Authenticate<br/>(resource_metadata)
+        Client->>IdP: OIDC authorization request + PKCE<br/>(resource = gateway)
+        IdP->>User: Login & consent
+        User-->>IdP: Approve
+        IdP-->>Client: Access Token + ID Token
+    end
+
+    rect rgb(255, 250, 225)
+        Note over User,MCP: 2. Gateway authentication
+        Client->>GW: MCP tools/call<br/>Authorization: Bearer <access token><br/>X-ID-Token: <ID token>
+        GW->>GW: MCP Authentication validates the access token<br/>(client-to-gateway auth)
+    end
+
+    rect rgb(255, 250, 225)
+        Note over User,MCP: 3. Token Exchange for ID-JAG (step 1)
+        GW->>IdP: Token Exchange<br/>(subject_token = ID Token,<br/>subject_token_type = id_token,<br/>requested_token_type = id-jag,<br/>audience = Atlassian AS issuer,<br/>scope = read + write)
+        IdP->>IdP: Validate ID token, resolve user,<br/>intersect scope with user roles
+        IdP-->>GW: ID-JAG (oauth-id-jag+jwt)<br/>scope narrowed to role
+        GW->>GW: Check typ, aud = audience, exp,<br/>requested scope ⊆ ID-JAG scope
+    end
+
+    rect rgb(255, 250, 225)
+        Note over User,MCP: 4. Present ID-JAG (step 2)
+        GW->>RAS: JWT Bearer Grant<br/>(assertion = ID-JAG, client_id + secret)
+        RAS->>IdP: Fetch OIDC discovery + JWKS<br/>(derived from iss)
+        IdP-->>RAS: Public signing key
+        RAS->>RAS: Validate signature, aud, client_id,<br/>exp, jti. Resolve user by email.
+        RAS-->>GW: Access Token<br/>(scope = ID-JAG scope)
+    end
+
+    rect rgb(255, 250, 225)
+        Note over User,MCP: 5. API Request
+        GW->>MCP: tools/call (with Atlassian access token,<br/>X-ID-Token removed)
+        MCP-->>GW: Response
+        GW-->>Client: Tool result
+    end
