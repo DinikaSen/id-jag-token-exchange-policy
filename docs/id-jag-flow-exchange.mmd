@@ -24,16 +24,16 @@ sequenceDiagram
     end
 
     rect rgb(255, 250, 225)
-        Note over User,MCP: 3. Obtain a gateway-bound refresh token (step 0)
-        GW->>IdP: Token Exchange<br/>(subject_token = Access Token,<br/>subject_token_type = jwt,<br/>requested_token_type = access_token,<br/>client_id + secret of the gateway)
-        IdP-->>GW: Access Token + Refresh Token<br/>(bound to the gateway client)
-        Note over GW: No refresh_token in the response → 502
+        Note over User,MCP: 3. Obtain an ID token for the gateway client (step 0)
+        GW->>IdP: Token Exchange<br/>(subject_token = Access Token,<br/>subject_token_type = jwt,<br/>requested_token_type = access_token,<br/>scope = openid,<br/>client_id + secret of the gateway)
+        IdP-->>GW: ID Token (aud = gateway client)<br/>+ Access Token (unused)
+        Note over GW: No id_token in the response → 502
     end
 
     rect rgb(255, 250, 225)
         Note over User,MCP: 4. Token Exchange for ID-JAG (step 1)
-        GW->>IdP: Token Exchange<br/>(subject_token = Refresh Token,<br/>subject_token_type = refresh_token,<br/>requested_token_type = id-jag,<br/>audience = Resource AS issuer,<br/>scope = read + write)
-        IdP->>IdP: Validate refresh token for this client,<br/>resolve user, intersect scope with user roles
+        GW->>IdP: Token Exchange<br/>(subject_token = ID Token,<br/>subject_token_type = id_token,<br/>requested_token_type = id-jag,<br/>audience = Resource AS issuer,<br/>scope = read + write)
+        IdP->>IdP: Validate ID token (aud = this client),<br/>resolve user, intersect scope with user roles
         IdP-->>GW: ID-JAG (oauth-id-jag+jwt)<br/>scope narrowed to role
         GW->>GW: Check typ, aud = audience, exp,<br/>requested scope ⊆ ID-JAG scope
     end
@@ -48,8 +48,8 @@ sequenceDiagram
     end
 
     rect rgb(255, 250, 225)
-        Note over User,MCP: 6. Revoke the refresh token (step 3, optional)
-        GW->>IdP: RFC 7009 revoke<br/>(token = Refresh Token, best effort)
+        Note over User,MCP: 6. Revoke the unused step-0 access token (step 3, optional)
+        GW->>IdP: RFC 7009 revoke<br/>(token = step-0 Access Token, best effort)
         IdP-->>GW: 200
     end
 

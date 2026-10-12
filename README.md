@@ -15,46 +15,53 @@ name products (WSO2 Identity Server, Atlassian, Figma, Claude Code) they are
 examples only; nothing in the policy is specific to them.
 
 Written in Go against `github.com/wso2/api-platform/sdk/core` v0.3.5 and
-compiled into the gateway image with the `ap` CLI. Policy version `v0.2.0`.
+compiled into the gateway image with the `ap` CLI. Policy version `v0.3.0`.
 
 ---
 
-## 1. Assertion types: what the spec allows, what this policy supports
+## 1. The assertion: an ID token, from the client or from the IdP
 
-The profile calls the credential the gateway presents to the IdP the
+The ID-JAG profile [draft-ietf-oauth-identity-assertion-authz-grant](https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-assertion-authz-grant/) calls the credential the gateway presents to the IdP as the
 **identity assertion**. It is the `subject_token` of an RFC 8693 token
 exchange whose `requested_token_type` is
 `urn:ietf:params:oauth:token-type:id-jag`. Section 4.3 of the draft allows
-three subject token types:
+three subject token types - ID Token, SAML Assertion, or a Refresh Token, but the
+[MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/specification/draft/basic/authorization/enterprise-managed-authorization)
+profiles only one of them - the ID token, and hence that is the only assertion this
+custom policy supports:
 
-| Assertion | `subject_token_type` | Spec status | This policy |
-|---|---|---|---|
-| OpenID Connect ID token | `urn:ietf:params:oauth:token-type:id_token` | Implementations MUST accept | **Supported**: `assertionType: id_token` |
-| Refresh token | `urn:ietf:params:oauth:token-type:refresh_token` | Optional, "to obtain a new ID-JAG without a new sign-in"; must be bound to the client requesting the ID-JAG | **Supported**: `assertionType: refresh_token` |
-| SAML 2.0 assertion | `urn:ietf:params:oauth:token-type:saml2` | Implementations MUST accept | Not supported, out of scope for this policy |
+There are 2 modes supported. What differs between the two modes is **where the ID token comes from**, chosen per policy instance
+with `idTokenSource`:
 
-Whichever assertion is used, the rest is the same: the IdP returns an ID-JAG,
-the gateway presents it to the Resource AS in an RFC 7523 JWT-bearer grant, and
-the resulting access token goes upstream.
+- `header`: the MCP client sends the user's ID token on a header alongside the
+  gateway access token.
+- `exchange`: the client sends only the gateway access token. The policy
+  exchanges it at the IdP, as the gateway's own client and with the `openid`
+  scope, and uses the ID token that exchange returns.
+
+Either way the rest is the same: the IdP returns an ID-JAG for the ID token,
+the gateway presents it to the Resource AS in an RFC 7523 JWT-bearer grant,
+and the resulting access token goes upstream.
 
 ---
 
-## 2. Flow and configuration per assertion type
+## 2. Flow and configuration per mode (per assertion type)
 
-### 2.1 ID token as the assertion (`assertionType: id_token`)
+### 2.1 ID token from the client passed as a custom header (`idTokenSource: header`)
 
 The client sends the gateway access token on `Authorization` and the user's ID
-token on `idTokenHeader`. Step 1 presents the ID token to the IdP, step 2
-presents the ID-JAG to the Resource AS, then the policy injects the result.
-There is no step 0 and no revocation.
+token on the header name configured under `idTokenHeader` config of the policy. 
+Step 1 presents the ID token to the IdP and gets the ID-JAG, step 2
+presents the ID-JAG to the Resource AS and gets the access token which the policy then injects to the tool call.
+There is no step 0 in this mode.
 
 ![ID-JAG flow with an ID token assertion](docs/id-jag-flow-id-token.png)
 
 *Source: [`docs/id-jag-flow-id-token.mmd`](docs/id-jag-flow-id-token.mmd)*
 
-**Configuration for the ID token flow**
+**Configuration for the header flow**
 
-- `assertionType: id_token`
+- `idTokenSource: header`
 - `idTokenHeader` (default `X-ID-Token`): the inbound header carrying the ID
   token. A `Bearer ` prefix is tolerated. The value must be a JWT.
 - Everything in [Common configuration](#23-common-configuration).
@@ -75,45 +82,54 @@ A sample MCP client (web UI and terminal) that implements this contract, keeping
 token from its MCP sign-in and sending it on the header, is at
 [id-jag-sample-mcp-client](https://github.com/DinikaSen/id-jag-sample-mcp-client).
 
-### 2.2 Refresh token as the assertion (`assertionType: refresh_token`)
+### 2.2 ID token obtained by the gateway (`idTokenSource: exchange`)
 
 The client sends only the gateway access token. Step 0 exchanges it at the
-IdP, as the gateway's own client, for an access token plus refresh token. Step
-1 presents that refresh token as the assertion, step 2 presents the ID-JAG to
-the Resource AS, optional step 3 revokes the refresh token, then the policy
-injects the result. A step 0 response without a refresh token is a 502: the
-policy never falls back to a non-compliant assertion.
+IdP, as the gateway's own client and with the `openid` scope. The IdP answers
+with an ID token issued to that client, which is exactly the audience the
+profile requires of the assertion (section 4.3.3). Step 1 presents that ID
+token, step 2 presents the ID-JAG to the Resource AS, optional step 3 revokes
+the access token the IdP issued alongside the ID token, then the policy
+injects the result. A step 0 response without an `id_token` is a 502: the
+policy never falls back to another assertion.
 
-The refresh token is bound to the gateway's IdP client, which is what the
-profile requires of a refresh token used as an assertion: the IdP validates it
-"as it would a standard refresh_token grant", bound to the authenticated
-client, unexpired, not revoked.
+Why step 0 asks for an access token rather than an ID token: most
+authorization servers, WSO2 Identity Server included, support
+`requested_token_type` of `access_token` or `jwt` and issue the ID token in
+addition when `openid` is in scope. The access token that comes with it is
+never used. With `idpRevocationEndpoint` set it is revoked as soon as the
+ID-JAG exists; without it, keep the gateway client's access token lifetime
+short at the IdP. No refresh token is requested, and one that arrives anyway
+is discarded with a warning.
 
-![ID-JAG flow with a refresh token assertion](docs/id-jag-flow-refresh-token.png)
+![ID-JAG flow with the ID token obtained by the gateway](docs/id-jag-flow-exchange.png)
 
-*Source: [`docs/id-jag-flow-refresh-token.mmd`](docs/id-jag-flow-refresh-token.mmd)*
+*Source: [`docs/id-jag-flow-exchange.mmd`](docs/id-jag-flow-exchange.mmd)*
 
-**Configuration for the refresh token flow**
+**Configuration for the exchange flow**
 
-- `assertionType: refresh_token`
+- `idTokenSource: exchange`
 - `accessTokenHeader` (default `Authorization`): the inbound header carrying
   the validated gateway access token.
 - `exchangeSubjectTokenType` (default `jwt`): the `subject_token_type` the IdP
   expects for that access token in step 0, `jwt` or `access_token`.
-- `exchangeScopes` (optional): `scope` sent in step 0.
+- `exchangeScopes` (default `openid`): `scope` sent in step 0. `openid` is
+  always included whatever is configured.
 - `idpRevocationEndpoint` (optional): the IdP's RFC 7009 endpoint. Setting it
-  enables step 3. Leave it empty if the IdP has none; the refresh token then
-  simply expires.
+  enables step 3. Leave it empty if the IdP has none; the unused access token
+  then simply expires.
 - Everything in [Common configuration](#23-common-configuration).
 
 **Prerequisites**
 
-- The IdP's token exchange with `requested_token_type` of `access_token` must
-  return a `refresh_token` to the gateway's client. If the IdP never issues
-  refresh tokens to that client, this flow cannot work and every request is a
-  502 with the reason in the gateway log.
-- The IdP must accept `refresh_token` as a subject token type for ID-JAG
-  issuance.
+- The IdP's token exchange must return an `id_token` to the gateway's client
+  when `openid` is requested. WSO2 Identity Server does; Keycloak documents
+  an ID token as a requested token type instead, which this policy does not
+  use yet. If the IdP never issues an ID token from an exchange, every request
+  is a 502 with the reason in the gateway log.
+- The IdP must accept `id_token` as a subject token type for ID-JAG issuance.
+- The audience requirement takes care of itself: the ID token is issued to the
+  gateway's IdP client, the same client that then requests the ID-JAG.
 
 ### 2.3 Common configuration
 
@@ -122,7 +138,7 @@ Used by both flows.
 | Parameter | Purpose |
 |---|---|
 | `credentialRef` | Name of the credential set in `config.toml` holding the IdP and Resource AS client credentials. See [section 4](#4-client-credentials-credentialref). |
-| `idpTokenEndpoint` | IdP token endpoint, used for step 1 (and step 0). |
+| `idpTokenEndpoint` | IdP token endpoint, used for step 1 (and step 0 in the exchange flow). |
 | `audience` | Issuer identifier of the Resource AS. Sent as `audience` in step 1 and checked against the ID-JAG's `aud`. |
 | `resourceAsTokenEndpoint` | Resource AS token endpoint for step 2. |
 | `idpScopes`, `idpResource` | Optional `scope` and RFC 8707 `resource` for step 1. The IdP may grant a subset of the scopes. |
@@ -134,19 +150,19 @@ Used by both flows.
 
 ---
 
-## 3. Choosing between the two assertion types
+## 3. Choosing between the two sources
 
-- **ID token** when the client can carry it. It is the assertion the spec
-  requires every IdP to accept, it costs one IdP call per exchange, and no
-  refresh token is ever minted. It needs the client or agent to forward the
-  user's ID token, which not every MCP client does.
-- **Refresh token** when only the gateway access token reaches the gateway,
-  which is the case for most off-the-shelf MCP clients. It costs one extra IdP
-  call per exchange and depends on the IdP issuing refresh tokens to the
-  gateway's client through token exchange.
+- **`header`** when the client can carry the ID token. It costs one IdP call
+  per exchange and nothing unused is ever minted. It needs the client or agent
+  to forward the user's ID token, which not every MCP client does, and the IdP
+  must add the gateway's client ID to that client's ID token audience.
+- **`exchange`** when only the gateway access token reaches the gateway, which
+  is the case for most off-the-shelf MCP clients such as Claude Code. It costs one extra IdP call
+  per exchange, leaves an unused access token at the IdP unless revocation is
+  on, and depends on the IdP issuing ID tokens from token exchange.
 
 Both can coexist on one gateway: the choice is per policy instance, so one MCP
-API can use `id_token` and another `refresh_token`.
+API can use `header` and another `exchange`.
 
 ---
 
@@ -162,7 +178,7 @@ confidential client at **one** Resource AS. A gateway fronting several MCP
 servers therefore has several sets, and each MCP API's policy instance points
 at its own.
 
-### Example: Atlassian and Figma behind one gateway
+### Example: When both Atlassian and Figma behind one gateway
 
 Two MCP servers are proxied by the same gateway, each with its own Resource AS
 and its own client registration for the gateway. The IdP is the same for both,
@@ -200,13 +216,13 @@ APIP_GW_IDJAG_FIGMA_RAS_CLIENT_ID=...
 APIP_GW_IDJAG_FIGMA_RAS_CLIENT_SECRET=...
 ```
 
-Policy instance on the **Atlassian MCP** API:
+Policy instance on the **Atlassian MCP** API. Note **credentialRef**:
 
 ```yaml
 - name: mcp-auth-id-jag
   version: v0
   params:
-    assertionType: refresh_token
+    idTokenSource: exchange
     credentialRef: atlassian
     idpTokenEndpoint: https://idp.example/oauth2/token
     idpRevocationEndpoint: https://idp.example/oauth2/revoke
@@ -215,13 +231,13 @@ Policy instance on the **Atlassian MCP** API:
     resourceAsTokenEndpoint: https://auth.atlassian.com/oauth/token
 ```
 
-Policy instance on the **Figma MCP** API:
+Policy instance on the **Figma MCP** API. Note **credentialRef**:
 
 ```yaml
 - name: mcp-auth-id-jag
   version: v0
   params:
-    assertionType: refresh_token
+    idTokenSource: exchange
     credentialRef: figma
     idpTokenEndpoint: https://idp.example/oauth2/token
     idpRevocationEndpoint: https://idp.example/oauth2/revoke
@@ -259,11 +275,12 @@ Tokens are obtained **just in time, per request**:
 
 - The **ID-JAG** is never cached. It is presented once to the Resource AS and
   dropped.
-- The **refresh token** (refresh token flow) is never cached or stored. It
-  lives only between steps 0 and 3.
+- The **step 0 tokens** (exchange flow) are never cached or stored. The ID
+  token lives only until step 1 has used it, the access token only until step
+  3 has revoked it.
 - The **Resource AS access token** is cached only when
   `cacheResourceAccessToken` is `true`, which it is not by default. The cache
-  is in memory, keyed by a SHA-256 of the inbound credential (ID token or
+  is in memory, keyed by a SHA-256 of the inbound token (ID token or
   gateway token), bounded to `cacheMaxEntries`, and an entry expires at the
   earlier of the token's own `expires_in` and the inbound credential's `exp`.
   `expiryBuffer` re-exchanges a little before expiry. When the upstream answers
@@ -282,7 +299,7 @@ client's `initialize` plus `tools/list` burst makes one exchange, not several.
 |---|---|
 | Missing or malformed inbound token | 401, `WWW-Authenticate: Bearer error="invalid_token"` |
 | Step 0 or 1 `invalid_grant` / `interaction_required` | 401 as above: the IdP no longer accepts the user's credential, so the MCP client signs in again |
-| Step 0 without a refresh token, `invalid_client`, ID-JAG fails validation, scope outside the ID-JAG, any step 2 rejection, transport failure | 502, with the step and reason in the gateway log, never the token values |
+| Step 0 without an ID token, `invalid_client`, ID-JAG fails validation, scope outside the ID-JAG, any step 2 rejection, transport failure | 502, with the step and reason in the gateway log, never the token values |
 
 This policy never carries a `resource_metadata` pointer: client discovery is
 MCP Authentication's job and has already happened by the time this runs. An
@@ -299,23 +316,23 @@ the Resource AS is the authority on them.
 
 ## 7. Full parameter reference
 
-Required: `assertionType`, `credentialRef`, `idpTokenEndpoint`, `audience`,
+Required: `idTokenSource`, `credentialRef`, `idpTokenEndpoint`, `audience`,
 `resourceAsTokenEndpoint`.
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `assertionType` | – | `id_token` or `refresh_token` |
-| `idTokenHeader` | `X-ID-Token` | `id_token` flow: inbound header carrying the user's ID token (Bearer prefix tolerated) |
-| `accessTokenHeader` | `Authorization` | `refresh_token` flow: inbound header carrying the validated gateway access token |
+| `idTokenSource` | – | `header` or `exchange` |
+| `idTokenHeader` | `X-ID-Token` | `header` flow: inbound header carrying the user's ID token (Bearer prefix tolerated) |
+| `accessTokenHeader` | `Authorization` | `exchange` flow: inbound header carrying the validated gateway access token |
 | `credentialRef` | – | Name of the credential set in `config.toml` |
 | `idpTokenEndpoint` | – | Used for steps 0 and 1 |
 | `idpClientAuthMethod` | `client_secret_post` | or `client_secret_basic` |
 | `audience` | – | Resource AS issuer identifier; sent as `audience`, checked against the ID-JAG `aud` |
 | `idpScopes` | `""` | `scope` for step 1; the IdP may grant a subset |
 | `idpResource` | `""` | RFC 8707 `resource` for step 1 |
-| `exchangeSubjectTokenType` | `jwt` | `refresh_token` flow: `subject_token_type` for the inbound access token in step 0 (`jwt` or `access_token`) |
-| `exchangeScopes` | `""` | `refresh_token` flow: `scope` for step 0 |
-| `idpRevocationEndpoint` | `""` | `refresh_token` flow: enables step 3 |
+| `exchangeSubjectTokenType` | `jwt` | `exchange` flow: `subject_token_type` for the inbound access token in step 0 (`jwt` or `access_token`) |
+| `exchangeScopes` | `openid` | `exchange` flow: `scope` for step 0; `openid` is always included |
+| `idpRevocationEndpoint` | `""` | `exchange` flow: enables step 3, revoking the unused step 0 access token |
 | `resourceAsTokenEndpoint` | – | Step 2 |
 | `resourceAsClientAuthMethod` | `client_secret_post` | or `client_secret_basic` |
 | `resourceAsScopes` | `""` | `scope` for step 2; must be within the ID-JAG's scope |
@@ -340,9 +357,9 @@ not a per-API parameter. See section 4.
   this policy requires.
 - An **IdP** that implements RFC 8693 with
   `requested_token_type=urn:ietf:params:oauth:token-type:id-jag` and accepts
-  the chosen assertion type as `subject_token_type`. For the refresh token
-  flow it must also issue a refresh token to the gateway's client from a token
-  exchange with `requested_token_type=access_token`.
+  `id_token` as `subject_token_type`. For the exchange flow it must also issue
+  an ID token to the gateway's client from a token exchange with the `openid`
+  scope.
 - A **Resource AS** that accepts the IdP's ID-JAG via the JWT-bearer grant and
   has the gateway registered as a confidential client.
 - A confidential client registration for the gateway at **both** the IdP and
@@ -368,61 +385,8 @@ not a per-API parameter. See section 4.
    run `docker compose up -d`. `restart` is not enough; it reuses the old
    container.
 
-Things that bite:
 
-- The build reports a **local policy count**. If it says `0`, a `filePath` is
-  wrong, and the build still succeeds, producing an image with nothing added.
-- The **builder image** decides what the policy engine contains, not
-  `gateway.version` and not the base images. Use a builder from the same patch
-  line as your runtime/controller bases.
-- A deployment that references this policy on a gateway whose image does not
-  contain it fails with
-  `policy 'mcp-auth-id-jag' major version 'v0' not found in loaded policy definitions`.
-- The control plane keeps the parameter schema it first saw for a given policy
-  name and version. After changing `policy-definition.yaml`, bump `version`
-  and re-attach the policy, or the UI keeps offering the old parameters.
-
-## 10. Attaching to an MCP API
-
-See [`examples/policy-attachment.yaml`](examples/policy-attachment.yaml) for a
-full placeholder example.
-
-Place it **after** MCP Authentication. There is no switch to run it without
-MCP Authentication in front; a request that reaches this policy
-unauthenticated is rejected.
-
-MCP Authentication validates `POST /mcp` only in the **request body phase**,
-because it needs the JSON-RPC method to apply its exemptions. Header phases of
-every policy run before any body phase, so when this policy's header phase
-sees no auth context it does not reject: it defers, buffers the request body,
-and runs the exchange from its own body phase right after that validation.
-Transport requests (`GET`/`DELETE /mcp`) carry no body, are validated by MCP
-Authentication in the header phase, and are exchanged there.
-
-Then configure the instance as in [section 2](#2-flow-and-configuration-per-assertion-type)
-and [section 4](#4-client-credentials-credentialref).
-
-## 11. Operational notes
-
-- **Pick one client authentication method per endpoint.** WSO2 Identity
-  Server, correctly per RFC 6749 §2.3, rejects requests carrying
-  `client_id`/`client_secret` in the body **and** an `Authorization: Basic`
-  header. Use `client_secret_basic` there. Basic credentials are
-  form-urlencoded before encoding, per RFC 6749 Appendix B.
-- **401 vs 502 is deliberate.** Only failures the *user* can fix by signing in
-  again become 401. Everything else is 502 so MCP clients do not loop on
-  sign-in when the gateway is misconfigured.
-- **Logs never contain tokens or secrets.** Cache keys are SHA-256 digests and
-  only the first 8 hex characters are logged. Endpoint URLs are reduced to
-  scheme+host+path, and any `user:pass@` in error strings is redacted. A
-  credential-set error names the empty field, never a value.
-- **The cache, when on, is per gateway replica and in memory.** A restart
-  simply re-exchanges. Rotated inbound tokens get a fresh exchange by design,
-  since consent or authorization state may have changed.
-- **Transports are shared process-wide** per proxy/TLS configuration, so many
-  policy instances with the same settings reuse one connection pool.
-
-## 12. Repository layout
+## 10. Repository layout
 
 ```
 .
@@ -445,19 +409,6 @@ The Go module path (`github.com/wso2/gateway-controllers/policies/mcp-auth-id-ja
 follows the gateway's convention for local `filePath` policies and does not
 need to resolve; the gateway builder compiles the directory in place.
 
-## 13. Development
-
-```bash
-GOTOOLCHAIN=auto go test -race ./...   # the module pins go 1.26.2
-gofmt -l .
-go vet ./...
-```
-
-The suite stands up fake IdP and Resource AS servers with `httptest` and
-covers both assertion flows, the missing-refresh-token failure, revocation,
-ID-JAG validation, scope subsetting, the error mapping, cache on and off,
-purge, single-flighting, phase deferral and credential-set resolution. Only
-the plumbing into the gateway needs an image build.
 
 ## License
 

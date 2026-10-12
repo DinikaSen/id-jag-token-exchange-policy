@@ -1,5 +1,5 @@
 name: mcp-auth-id-jag
-version: v0.2.0
+version: v0.3.0
 displayName: MCP Auth ID-JAG
 description: |
   Obtains a per-user access token for an upstream MCP server through the
@@ -11,12 +11,14 @@ description: |
   (2) RFC 7523 JWT-bearer grant at the Resource AS with the ID-JAG as the
   assertion, yielding the access token that is injected into a request header
   before forwarding.
-  The assertion is either an ID token carried on a configurable inbound header,
-  or a refresh token the policy first obtains by exchanging the inbound access
-  token at the IdP (same client, so the refresh token is bound to the client
-  that then requests the ID-JAG). Tokens are obtained just in time per request:
-  the ID-JAG and any refresh token are never cached or stored; the final
-  Resource AS access token is cached only when `cacheResourceAccessToken` is on.
+  The assertion is always the user's ID token, the only assertion the MCP
+  Enterprise-Managed Authorization extension profiles. It is either carried by
+  the client on a configurable inbound header, or obtained by the policy in a
+  preceding token exchange (step 0) of the inbound access token at the IdP with
+  the openid scope, so the ID token is issued to the gateway's own client.
+  Tokens are obtained just in time per request: the ID-JAG and the step 0
+  tokens are never cached or stored; the final Resource AS access token is
+  cached only when `cacheResourceAccessToken` is on.
   Client credentials are never policy parameters - they come from the gateway's
   config.toml / environment as named credential sets selected by `credentialRef`.
   Runs only after the MCP Authentication policy has validated the client's
@@ -28,30 +30,30 @@ description: |
 parameters:
   type: object
   additionalProperties: false
-  required: ["assertionType", "credentialRef", "idpTokenEndpoint", "audience", "resourceAsTokenEndpoint"]
+  required: ["idTokenSource", "credentialRef", "idpTokenEndpoint", "audience", "resourceAsTokenEndpoint"]
   properties:
-    # ─── Assertion source ──────────────────────────────────────────────────
-    assertionType:
+    # ─── ID token source ───────────────────────────────────────────────────
+    idTokenSource:
       type: string
       x-wso2-policy-advanced-param: false
       description: |
-        Which identity assertion is presented to the IdP in the ID-JAG token
-        exchange. `id_token`: the inbound request carries the user's ID token
-        on the header named by idTokenHeader. `refresh_token`: the policy first
-        exchanges the inbound access token (from accessTokenHeader) at the IdP
-        for a fresh access token + refresh token, then uses that refresh token
-        as the assertion. The IdP must return a refresh token from that
-        exchange or the request fails with 502.
+        Where the user's ID token, the assertion presented to the IdP in the
+        ID-JAG token exchange, comes from. `header`: the inbound request
+        carries it on the header named by idTokenHeader. `exchange`: the
+        policy first exchanges the inbound access token (from
+        accessTokenHeader) at the IdP, as its own client and with the openid
+        scope, and uses the ID token that exchange returns. The IdP must
+        return an id_token from that exchange or the request fails with 502.
       enum:
-        - id_token
-        - refresh_token
+        - header
+        - exchange
     idTokenHeader:
       type: string
       x-wso2-policy-advanced-param: false
       minLength: 1
       description: |
         Header of the inbound request that carries the user's ID token
-        (assertionType = id_token). Read from the downstream request snapshot,
+        (idTokenSource = header). Read from the downstream request snapshot,
         so it is seen even if an earlier policy stripped it. A Bearer scheme
         prefix is tolerated.
       default: "X-ID-Token"
@@ -61,9 +63,9 @@ parameters:
       minLength: 1
       description: |
         Header of the inbound request that carries the validated access token
-        exchanged for a refresh token (assertionType = refresh_token). Read
-        from the downstream request snapshot. The Bearer scheme prefix is
-        stripped case-insensitively.
+        exchanged for an ID token (idTokenSource = exchange). Read from the
+        downstream request snapshot. The Bearer scheme prefix is stripped
+        case-insensitively.
       default: "Authorization"
     credentialRef:
       type: string
@@ -82,7 +84,7 @@ parameters:
       minLength: 1
       description: |
         URL of the IdP token endpoint used for the RFC 8693 token exchange
-        (and, in refresh_token mode, for the preceding access-token exchange).
+        (and, with idTokenSource = exchange, for the preceding step 0).
     idpClientAuthMethod:
       type: string
       x-wso2-policy-advanced-param: true
@@ -135,10 +137,10 @@ parameters:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
-        refresh_token mode only. `subject_token_type` the IdP expects for the
-        inbound access token in the access-token exchange that yields the
-        refresh token. `jwt` sends urn:ietf:params:oauth:token-type:jwt,
-        `access_token` sends urn:ietf:params:oauth:token-type:access_token.
+        idTokenSource = exchange only. `subject_token_type` the IdP expects
+        for the inbound access token in step 0. `jwt` sends
+        urn:ietf:params:oauth:token-type:jwt, `access_token` sends
+        urn:ietf:params:oauth:token-type:access_token.
       enum:
         - jwt
         - access_token
@@ -147,19 +149,20 @@ parameters:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
-        refresh_token mode only. Space-separated scopes requested in the
-        access-token exchange that yields the refresh token. Optional;
-        omitted when empty.
-      default: ""
+        idTokenSource = exchange only. Space-separated scopes requested in
+        step 0. `openid` is always included, since without it the IdP issues
+        no ID token; add more only if the IdP needs them to issue one.
+      default: "openid"
     idpRevocationEndpoint:
       type: string
       x-wso2-policy-advanced-param: true
       description: |
-        refresh_token mode only. RFC 7009 revocation endpoint of the IdP.
-        When set, the refresh token obtained for the exchange is revoked as
-        soon as the ID-JAG has been issued, so no live refresh token is left
-        behind at the IdP. Best effort: a failed revocation is logged, the
-        request still succeeds. Empty disables revocation.
+        idTokenSource = exchange only. RFC 7009 revocation endpoint of the
+        IdP. Step 0 asks for an ID token, but an IdP also issues an access
+        token with it, which the policy never uses. When set, that access
+        token is revoked as soon as the ID-JAG has been issued, so nothing
+        unused stays live at the IdP. Best effort: a failed revocation is
+        logged, the request still succeeds. Empty disables revocation.
       default: ""
 
     # ─── Resource Authorization Server ─────────────────────────────────────
@@ -210,9 +213,9 @@ parameters:
       x-wso2-policy-advanced-param: false
       description: |
         Keep the Resource AS access token in memory, keyed by a hash of the
-        inbound assertion (ID token or access token), until it expires, so
+        inbound token (ID token or access token), until it expires, so
         later requests from the same user skip the exchange. Off by default:
-        every request then runs the full exchange. The ID-JAG and refresh
+        every request then runs the full exchange. The ID-JAG and the step 0
         tokens are never cached regardless of this setting.
       default: false
     cacheMaxEntries:

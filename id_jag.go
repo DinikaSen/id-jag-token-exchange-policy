@@ -21,22 +21,24 @@
 // upstream MCP server through the Identity Assertion JWT Authorization Grant
 // (ID-JAG) profile, draft-ietf-oauth-identity-assertion-authz-grant:
 //
-//	step 0 (refresh_token mode only)
-//	        RFC 8693 token exchange at the IdP: inbound access token in,
-//	        access token + refresh token out. The refresh token is bound to
-//	        the gateway's IdP client, as the profile requires of a refresh
-//	        token presented as the identity assertion.
-//	step 1  RFC 8693 token exchange at the IdP: identity assertion (ID token
-//	        or that refresh token) in, ID-JAG out, for the Resource AS named
-//	        by `audience`.
+//	step 0 (idTokenSource = exchange only)
+//	        RFC 8693 token exchange at the IdP: inbound access token in, with
+//	        the openid scope, so the response carries an ID token for the
+//	        gateway's own IdP client. Only that ID token is used; the access
+//	        token the IdP issues alongside it is discarded (and revoked when
+//	        idpRevocationEndpoint is set).
+//	step 1  RFC 8693 token exchange at the IdP: the ID token in, ID-JAG out,
+//	        for the Resource AS named by `audience`.
 //	step 2  RFC 7523 JWT-bearer grant at the Resource AS: ID-JAG in, access
 //	        token out.
-//	step 3  (refresh_token mode, when idpRevocationEndpoint is set)
-//	        RFC 7009 revocation of the step-0 refresh token, best effort.
+//	step 3  (idTokenSource = exchange, when idpRevocationEndpoint is set)
+//	        RFC 7009 revocation of the unused step-0 access token, best effort.
 //
-// The step-2 access token replaces the inbound credential before the request
-// is forwarded. Nothing but that access token is ever retained, and only when
-// cacheResourceAccessToken is on. Client credentials come from named sets in
+// The assertion presented in step 1 is always an ID token, the only assertion
+// the MCP Enterprise-Managed Authorization extension profiles; the policy
+// never presents a refresh token. The step-2 access token replaces the inbound
+// credential before the request is forwarded. Nothing but that access token is
+// ever retained, and only when cacheResourceAccessToken is on. Client credentials come from named sets in
 // the gateway configuration, never from policy parameters. The policy has no
 // client-facing behaviour: it never runs unless the request is already
 // authenticated, and it does not touch the auth context that authentication
@@ -69,11 +71,8 @@ const (
 	// response must carry.
 	TokenTypeIDJAG = "urn:ietf:params:oauth:token-type:id-jag"
 
-	// TokenTypeIDToken is the subject_token_type for an ID token assertion.
+	// TokenTypeIDToken is the subject_token_type of the step-1 assertion.
 	TokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
-
-	// TokenTypeRefreshToken is the subject_token_type for a refresh token assertion.
-	TokenTypeRefreshToken = "urn:ietf:params:oauth:token-type:refresh_token"
 
 	// TokenTypeAccessToken is the requested_token_type of step 0, and one of the
 	// subject_token_type values an IdP may expect for the inbound access token there.
@@ -86,9 +85,13 @@ const (
 	// IDJAGJWTType is the required `typ` header of an ID-JAG.
 	IDJAGJWTType = "oauth-id-jag+jwt"
 
-	// AssertionTypeIDToken / AssertionTypeRefreshToken are the assertionType parameter values.
-	AssertionTypeIDToken      = "id_token"
-	AssertionTypeRefreshToken = "refresh_token"
+	// IDTokenSourceHeader / IDTokenSourceExchange are the idTokenSource parameter values:
+	// the client sends the ID token on idTokenHeader, or the policy obtains one in step 0.
+	IDTokenSourceHeader   = "header"
+	IDTokenSourceExchange = "exchange"
+
+	// ScopeOpenID is the scope step 0 must request for the IdP to issue an ID token.
+	ScopeOpenID = "openid"
 
 	// MetadataKeyCacheKey carries the request's cache key from the request phase to the
 	// response phase, so an upstream rejection purges only that entry.
@@ -106,10 +109,10 @@ const (
 	// ClientAuthMethodPost (client_secret_post) sends client ID/secret as form fields.
 	ClientAuthMethodPost = "client_secret_post"
 
-	// defaultIDTokenHeader is where the ID token is read from in id_token mode.
+	// defaultIDTokenHeader is where the ID token is read from when idTokenSource is header.
 	defaultIDTokenHeader = "X-ID-Token"
 
-	// defaultAccessTokenHeader is where the access token is read from in refresh_token mode.
+	// defaultAccessTokenHeader is where the access token is read from when idTokenSource is exchange.
 	defaultAccessTokenHeader = "Authorization"
 
 	// defaultExpiryBuffer is how far ahead of expiry a cached token is treated as stale.
@@ -132,8 +135,8 @@ var exchangeSubjectTokenTypeURN = map[string]string{
 
 // policyParams bundles all extracted, validated policy params.
 type policyParams struct {
-	// Assertion source
-	assertionType     string
+	// ID token source
+	idTokenSource     string
 	idTokenHeader     string
 	accessTokenHeader string
 	credentialRef     string
@@ -175,10 +178,10 @@ type policyParams struct {
 	tlsInsecureSkipVerify  bool
 }
 
-// inboundHeader is the header the assertion (or the access token it is derived from) is read
-// from for the configured assertionType.
+// inboundHeader is the header the ID token (or the access token it is obtained from) is read
+// from for the configured idTokenSource.
 func (p policyParams) inboundHeader() string {
-	if p.assertionType == AssertionTypeRefreshToken {
+	if p.idTokenSource == IDTokenSourceExchange {
 		return p.accessTokenHeader
 	}
 	return p.idTokenHeader
@@ -208,7 +211,7 @@ func (e *stepError) Unwrap() error { return e.err }
 func stepName(step int) string {
 	switch step {
 	case 0:
-		return "IdP access-token exchange for refresh token"
+		return "IdP access-token exchange for ID token"
 	case 1:
 		return "IdP ID-JAG token exchange"
 	case 2:
@@ -249,12 +252,12 @@ func GetPolicy(metadata policy.PolicyMetadata, params map[string]interface{}) (p
 	}
 
 	slog.Info(logPrefix+"policy initialized",
-		"assertionType", p.assertionType, "inboundHeader", p.inboundHeader(),
+		"idTokenSource", p.idTokenSource, "inboundHeader", p.inboundHeader(),
 		"credentialRef", p.credentialRef,
 		"idpTokenEndpoint", sanitizeEndpointForLogging(p.idpTokenEndpoint),
 		"resourceAsTokenEndpoint", sanitizeEndpointForLogging(p.resourceAsTokenEndpoint),
 		"audience", p.audience,
-		"revokeRefreshToken", p.idpRevocationEndpoint != "",
+		"revokeExchangedAccessToken", p.idpRevocationEndpoint != "",
 		"cacheResourceAccessToken", p.cacheResourceAccessToken)
 
 	return pol, nil
@@ -265,8 +268,8 @@ func validateAndExtractParams(params map[string]interface{}) (policyParams, erro
 	var p policyParams
 	var err error
 
-	// Assertion source
-	if p.assertionType, err = getEnumParam(params, "assertionType", "", AssertionTypeIDToken, AssertionTypeRefreshToken); err != nil {
+	// ID token source
+	if p.idTokenSource, err = getEnumParam(params, "idTokenSource", "", IDTokenSourceHeader, IDTokenSourceExchange); err != nil {
 		return policyParams{}, err
 	}
 	p.idTokenHeader = getStringParamOrDefault(params, "idTokenHeader", defaultIDTokenHeader)
@@ -303,7 +306,7 @@ func validateAndExtractParams(params map[string]interface{}) (policyParams, erro
 		return policyParams{}, err
 	}
 	p.exchangeSubjectTokenType = exchangeSubjectTokenTypeURN[short]
-	p.exchangeScopes = getStringParam(params, "exchangeScopes")
+	p.exchangeScopes = withOpenIDScope(getStringParam(params, "exchangeScopes"))
 	p.idpRevocationEndpoint = getStringParam(params, "idpRevocationEndpoint")
 
 	// Resource AS
@@ -346,6 +349,19 @@ func validateAndExtractParams(params map[string]interface{}) (policyParams, erro
 	}
 
 	return p, nil
+}
+
+// withOpenIDScope guarantees the step-0 scope contains openid: without it the IdP issues no
+// ID token and the exchange cannot work. Operator-supplied scopes are kept, deduplicated.
+func withOpenIDScope(scopes string) string {
+	fields := strings.Fields(scopes)
+	out := []string{ScopeOpenID}
+	for _, f := range fields {
+		if f != ScopeOpenID {
+			out = append(out, f)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // Mode declares processing per phase. The request body is buffered because the MCP
@@ -426,10 +442,10 @@ func (p *Policy) acquire(ctx context.Context, shared *policy.SharedContext, snap
 	header := p.params.inboundHeader()
 	inbound := bearerFrom(snapshot.Get(header))
 	if inbound == "" {
-		slog.Warn(logPrefix+"inbound token missing", "assertionType", p.params.assertionType, "header", header)
-		return fail(unauthorized(fmt.Sprintf("missing %s in %s header", p.params.assertionType, header)))
+		slog.Warn(logPrefix+"inbound token missing", "idTokenSource", p.params.idTokenSource, "header", header)
+		return fail(unauthorized(fmt.Sprintf("missing %s in %s header", inboundTokenName(p.params.idTokenSource), header)))
 	}
-	if p.params.assertionType == AssertionTypeIDToken && !looksLikeJWT(inbound) {
+	if p.params.idTokenSource == IDTokenSourceHeader && !looksLikeJWT(inbound) {
 		slog.Warn(logPrefix+"inbound ID token is not a JWT", "header", header)
 		return fail(unauthorized(fmt.Sprintf("%s header does not carry an ID token", header)))
 	}
@@ -457,6 +473,14 @@ func (p *Policy) acquire(ctx context.Context, shared *policy.SharedContext, snap
 		cacheState = "miss"
 	}
 	return tok, cacheState, nil
+}
+
+// inboundTokenName names the token the inbound header must carry, for error messages.
+func inboundTokenName(source string) string {
+	if source == IDTokenSourceExchange {
+		return "access token"
+	}
+	return "ID token"
 }
 
 // downstreamSnapshot returns the pre-mutation request headers, or nil.
@@ -491,24 +515,24 @@ func phaseOf(shared *policy.SharedContext) string {
 }
 
 // exchange runs steps 0-3 for one inbound credential. Only the step-2 access token leaves this
-// function; the refresh token and the ID-JAG live in its locals and nowhere else.
+// function; the step-0 tokens and the ID-JAG live in its locals and nowhere else.
 func (p *Policy) exchange(ctx context.Context, inbound, key string) (*exchangedToken, error) {
-	subject, subjectType := inbound, TokenTypeIDToken
+	idToken := inbound
 
-	if p.params.assertionType == AssertionTypeRefreshToken {
-		refreshToken, err := p.obtainRefreshToken(ctx, inbound)
+	if p.params.idTokenSource == IDTokenSourceExchange {
+		exchanged, err := p.obtainIDToken(ctx, inbound, key)
 		if err != nil {
 			return nil, &stepError{step: 0, err: err}
 		}
-		subject, subjectType = refreshToken, TokenTypeRefreshToken
-		if p.params.idpRevocationEndpoint != "" {
-			// Runs whether or not step 2 succeeds: once step 1 has consumed the refresh token
-			// there is no reason for it to stay valid at the IdP.
-			defer p.revokeRefreshToken(ctx, refreshToken, key)
+		idToken = exchanged.idToken
+		if p.params.idpRevocationEndpoint != "" && exchanged.accessToken != "" {
+			// The access token the IdP issued alongside the ID token is never used. Runs
+			// whether or not step 2 succeeds, so it does not stay live at the IdP.
+			defer p.revokeExchangedAccessToken(ctx, exchanged.accessToken, key)
 		}
 	}
 
-	idJag, idJagScopes, err := p.requestIDJAG(ctx, subject, subjectType, key)
+	idJag, idJagScopes, err := p.requestIDJAG(ctx, idToken, TokenTypeIDToken, key)
 	if err != nil {
 		return nil, &stepError{step: 1, err: err}
 	}
@@ -535,35 +559,51 @@ func (p *Policy) exchange(ctx context.Context, inbound, key string) (*exchangedT
 		p.cache.put(key, result, p.params.cacheMaxEntries)
 	}
 
-	slog.Debug(logPrefix+"exchange complete", "cacheKeyId", key[:8], "assertionType", p.params.assertionType,
+	slog.Debug(logPrefix+"exchange complete", "cacheKeyId", key[:8], "idTokenSource", p.params.idTokenSource,
 		"grantedScope", result.grantedScope, "cached", p.params.cacheResourceAccessToken)
 	return result, nil
 }
 
-// obtainRefreshToken is step 0: RFC 8693 token exchange at the IdP that turns the inbound
-// access token into an access token + refresh token for the gateway's own IdP client. Only the
-// refresh token is kept, and only until step 1 has used it. An IdP that answers without a
-// refresh token is a hard failure - the policy never falls back to a non-compliant assertion.
-func (p *Policy) obtainRefreshToken(ctx context.Context, accessToken string) (string, error) {
+// step0Result is what step 0 yields: the ID token the policy presents in step 1, and the
+// access token the IdP issued alongside it, kept only so it can be revoked.
+type step0Result struct {
+	idToken     string
+	accessToken string
+}
+
+// obtainIDToken is step 0: RFC 8693 token exchange at the IdP that turns the inbound access
+// token into tokens for the gateway's own IdP client. The request carries the openid scope, so
+// the response includes an ID token whose audience is the gateway's client - exactly what the
+// profile (§4.3.3) requires of the assertion step 1 presents. An IdP that answers without an
+// ID token is a hard failure: the policy never presents anything but an ID token.
+func (p *Policy) obtainIDToken(ctx context.Context, accessToken, key string) (step0Result, error) {
 	form := url.Values{}
 	form.Set("grant_type", GrantTypeTokenExchange)
 	form.Set("subject_token", accessToken)
 	form.Set("subject_token_type", p.params.exchangeSubjectTokenType)
 	form.Set("requested_token_type", TokenTypeAccessToken)
-	if p.params.exchangeScopes != "" {
-		form.Set("scope", p.params.exchangeScopes)
-	}
+	form.Set("scope", p.params.exchangeScopes)
 
 	tok, err := fetchWithRetry(ctx, p.params.tokenRequestMaxRetries, func(ctx context.Context) (*Token, error) {
 		return doTokenRequest(ctx, p.httpClient, p.params.idpTokenEndpoint, p.idpCred, cloneURLValues(form), p.params.idpTokenRequestHeaders)
 	})
 	if err != nil {
-		return "", err
+		return step0Result{}, err
 	}
-	if tok.RefreshToken == "" {
-		return "", &nonRetryableTokenError{err: fmt.Errorf("IdP token exchange response carried no refresh_token: the IdP must issue a refresh token to client %q from an access-token exchange for refresh_token assertions to work", p.idpCred.id)}
+	if tok.IDToken == "" {
+		return step0Result{}, &nonRetryableTokenError{err: fmt.Errorf("IdP token exchange response carried no id_token: the IdP must issue an ID token to client %q from an access-token exchange with the openid scope for idTokenSource=exchange to work", p.idpCred.id)}
 	}
-	return tok.RefreshToken, nil
+	if !looksLikeJWT(tok.IDToken) {
+		return step0Result{}, &nonRetryableTokenError{err: fmt.Errorf("IdP token exchange response id_token is not a JWT")}
+	}
+	if tok.RefreshToken != "" {
+		slog.Warn(logPrefix+"step 0 response carried a refresh_token, which the policy never uses; discarded. Disable refresh tokens for the gateway's IdP client", "cacheKeyId", key[:8])
+	}
+	if auds := claimStrings(jwtClaims(tok.IDToken), "aud"); len(auds) > 0 && !contains(auds, p.idpCred.id) {
+		slog.Warn(logPrefix+"step 0 ID token aud does not include the IdP client that requested it; the IdP will reject it as the ID-JAG assertion (profile §4.3.3)",
+			"aud", auds, "idpClientId", p.idpCred.id, "cacheKeyId", key[:8])
+	}
+	return step0Result{idToken: tok.IDToken, accessToken: tok.AccessToken}, nil
 }
 
 // requestIDJAG is step 1: RFC 8693 token exchange at the IdP with the identity assertion as the
@@ -692,19 +732,20 @@ func (p *Policy) redeemIDJAG(ctx context.Context, idJag string, idJagScopes []st
 	})
 }
 
-// revokeRefreshToken is step 3: best-effort RFC 7009 revocation of the step-0 refresh token.
-// Detached from the request context so a client disconnect mid-exchange still revokes.
-func (p *Policy) revokeRefreshToken(ctx context.Context, refreshToken, key string) {
+// revokeExchangedAccessToken is step 3: best-effort RFC 7009 revocation of the access token
+// step 0 produced and nothing used. Detached from the request context so a client disconnect
+// mid-exchange still revokes.
+func (p *Policy) revokeExchangedAccessToken(ctx context.Context, accessToken, key string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), revocationTimeout)
 	defer cancel()
-	err := doRevocationRequest(rctx, p.httpClient, p.params.idpRevocationEndpoint, p.idpCred, refreshToken, "refresh_token", p.params.idpTokenRequestHeaders)
+	err := doRevocationRequest(rctx, p.httpClient, p.params.idpRevocationEndpoint, p.idpCred, accessToken, "access_token", p.params.idpTokenRequestHeaders)
 	if err != nil {
-		slog.Warn(logPrefix+"refresh token revocation failed; the token stays valid at the IdP until it expires",
+		slog.Warn(logPrefix+"revocation of the unused step-0 access token failed; it stays valid at the IdP until it expires",
 			"error", redactURLCredentials(err.Error()),
 			"idpRevocationEndpoint", sanitizeEndpointForLogging(p.params.idpRevocationEndpoint), "cacheKeyId", key[:8])
 		return
 	}
-	slog.Debug(logPrefix+"refresh token revoked", "cacheKeyId", key[:8])
+	slog.Debug(logPrefix+"unused step-0 access token revoked", "cacheKeyId", key[:8])
 }
 
 // classifyAndRespond maps exchange errors to the HTTP response:
@@ -796,7 +837,7 @@ func (p *Policy) headerMods(tok *exchangedToken, cacheState string) (set map[str
 	}
 	analytics = map[string]any{
 		"id-jag.cache":         cacheState,
-		"id-jag.assertionType": p.params.assertionType,
+		"id-jag.idTokenSource": p.params.idTokenSource,
 		"id-jag.grantedScope":  tok.grantedScope,
 	}
 	return set, remove, analytics
@@ -961,6 +1002,16 @@ func scopeList(claims map[string]any) []string {
 		}
 	}
 	return nil
+}
+
+// contains reports whether list has item.
+func contains(list []string, item string) bool {
+	for _, v := range list {
+		if v == item {
+			return true
+		}
+	}
+	return false
 }
 
 // scopesOutside returns the members of requested that are not in granted.

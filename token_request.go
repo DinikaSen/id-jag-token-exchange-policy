@@ -65,9 +65,9 @@ const (
 	// Content-Length, so a misbehaving server can't exhaust memory.
 	maxTokenResponseBytes = 1 << 20 // 1MiB
 
-	// revocationTimeout bounds the best-effort refresh-token revocation that runs after the
-	// ID-JAG is issued; it is detached from the request context so a client disconnect never
-	// leaves a live refresh token behind.
+	// revocationTimeout bounds the best-effort revocation of the unused step-0 access token
+	// that runs after the ID-JAG is issued; it is detached from the request context so a
+	// client disconnect never leaves that token live for longer than needed.
 	revocationTimeout = 5 * time.Second
 )
 
@@ -81,6 +81,7 @@ type Token struct {
 	AccessToken     string
 	TokenType       string
 	RefreshToken    string
+	IDToken         string
 	IssuedTokenType string
 	Scope           string
 	Expiry          time.Time
@@ -147,6 +148,7 @@ type tokenJSON struct {
 	AccessToken     string          `json:"access_token"`
 	TokenType       string          `json:"token_type"`
 	RefreshToken    string          `json:"refresh_token"`
+	IDToken         string          `json:"id_token"`
 	IssuedTokenType string          `json:"issued_token_type"`
 	Scope           string          `json:"scope"`
 	ExpiresIn       json.RawMessage `json:"expires_in"`
@@ -197,6 +199,7 @@ func doTokenRequest(ctx context.Context, httpClient *http.Client, tokenEndpoint 
 		AccessToken:     parsed.AccessToken,
 		TokenType:       parsed.TokenType,
 		RefreshToken:    parsed.RefreshToken,
+		IDToken:         parsed.IDToken,
 		IssuedTokenType: parsed.IssuedTokenType,
 		Scope:           strings.TrimSpace(parsed.Scope),
 	}

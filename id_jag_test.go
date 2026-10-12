@@ -44,7 +44,8 @@ type fakeIdP struct {
 	revocations []url.Values
 
 	// Behaviour knobs
-	refreshToken     string // step 0 response; "" omits refresh_token
+	idToken          string // step 0 response; "" omits id_token
+	step0RefreshTok  string // step 0 response; "" omits refresh_token
 	step0Error       *TokenError
 	step1Error       *TokenError
 	idJagTyp         string
@@ -60,7 +61,9 @@ type fakeIdP struct {
 
 func newFakeIdP(t *testing.T, clientID, audience string) *fakeIdP {
 	t.Helper()
-	f := &fakeIdP{refreshToken: "rt-0123456789abcdef0123", idJagTyp: IDJAGJWTType, clientID: clientID, audience: audience, revocationStatus: 200}
+	f := &fakeIdP{idJagTyp: IDJAGJWTType, clientID: clientID, audience: audience, revocationStatus: 200}
+	f.idToken = makeJWT(map[string]any{"typ": "JWT", "alg": "none"},
+		map[string]any{"iss": "https://idp.example", "sub": "user-1", "aud": clientID, "exp": time.Now().Add(time.Hour).Unix()})
 	f.idJagAud = audience
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", f.token)
@@ -86,10 +89,14 @@ func (f *fakeIdP) token(w http.ResponseWriter, r *http.Request) {
 			writeTokenError(w, f.step0Error.StatusCode, f.step0Error.ErrorCode, f.step0Error.ErrorDescription)
 			return
 		}
-		resp := map[string]any{"access_token": "at-fresh-0123456789abcdef", "token_type": "Bearer", "expires_in": 3600,
+		resp := map[string]any{"access_token": step0AccessToken, "token_type": "Bearer", "expires_in": 3600,
 			"issued_token_type": TokenTypeAccessToken}
-		if f.refreshToken != "" {
-			resp["refresh_token"] = f.refreshToken
+		// Like a real IdP, the ID token is only issued when openid was requested.
+		if f.idToken != "" && contains(strings.Fields(r.PostForm.Get("scope")), ScopeOpenID) {
+			resp["id_token"] = f.idToken
+		}
+		if f.step0RefreshTok != "" {
+			resp["refresh_token"] = f.step0RefreshTok
 		}
 		writeJSON(w, 200, resp)
 	case TokenTypeIDJAG: // step 1
@@ -150,6 +157,9 @@ func (f *fakeIdP) revoked() []url.Values {
 	defer f.mu.Unlock()
 	return append([]url.Values(nil), f.revocations...)
 }
+
+// step0AccessToken is the access token the fake IdP issues alongside the ID token in step 0.
+const step0AccessToken = "at-fresh-0123456789abcdef"
 
 // fakeResourceAS answers the JWT-bearer grant and records what it was asked.
 type fakeResourceAS struct {
@@ -243,7 +253,7 @@ func newHarness(t *testing.T) *harness {
 
 func (h *harness) params(overrides map[string]any) map[string]any {
 	p := map[string]any{
-		"assertionType":           AssertionTypeIDToken,
+		"idTokenSource":           IDTokenSourceHeader,
 		"credentialRef":           testCredential,
 		"idpTokenEndpoint":        h.idp.srv.URL + "/token",
 		"audience":                testAudience,
@@ -377,7 +387,7 @@ func TestIDTokenMode_HappyPath(t *testing.T) {
 
 	step0, step1 := h.idp.calls()
 	if len(step0) != 0 {
-		t.Fatalf("id_token mode must not perform the access-token exchange, saw %d", len(step0))
+		t.Fatalf("header mode must not perform the access-token exchange, saw %d", len(step0))
 	}
 	if len(step1) != 1 {
 		t.Fatalf("expected one ID-JAG exchange, saw %d", len(step1))
@@ -407,16 +417,15 @@ func TestIDTokenMode_HappyPath(t *testing.T) {
 		t.Fatalf("the auth context MCP Authentication set must be left untouched: %+v", ac)
 	}
 	if len(h.idp.revoked()) != 0 {
-		t.Fatalf("nothing to revoke in id_token mode")
+		t.Fatalf("nothing to revoke in header mode")
 	}
 }
 
-func TestRefreshTokenMode_HappyPath_WithRevocation(t *testing.T) {
+func TestExchangeMode_HappyPath_WithRevocation(t *testing.T) {
 	h := newHarness(t)
 	pol := h.policy(map[string]any{
-		"assertionType":         AssertionTypeRefreshToken,
+		"idTokenSource":         IDTokenSourceExchange,
 		"idpRevocationEndpoint": h.idp.srv.URL + "/revoke",
-		"exchangeScopes":        "openid",
 	})
 
 	at := userAccessToken(time.Now().Add(time.Hour))
@@ -428,6 +437,9 @@ func TestRefreshTokenMode_HappyPath_WithRevocation(t *testing.T) {
 	}
 	if len(mods.HeadersToRemove) != 0 {
 		t.Fatalf("Authorization is overwritten, not removed; got %v", mods.HeadersToRemove)
+	}
+	if mods.AnalyticsMetadata["id-jag.idTokenSource"] != IDTokenSourceExchange {
+		t.Fatalf("analytics = %v", mods.AnalyticsMetadata)
 	}
 
 	step0, step1 := h.idp.calls()
@@ -444,8 +456,8 @@ func TestRefreshTokenMode_HappyPath_WithRevocation(t *testing.T) {
 		}
 	}
 	s1 := step1[0]
-	if s1.Get("subject_token") != h.idp.refreshToken || s1.Get("subject_token_type") != TokenTypeRefreshToken {
-		t.Fatalf("step 1 must present the step-0 refresh token as a refresh_token assertion, got %v", s1)
+	if s1.Get("subject_token") != h.idp.idToken || s1.Get("subject_token_type") != TokenTypeIDToken {
+		t.Fatalf("step 1 must present the step-0 ID token as an id_token assertion, got %v", s1)
 	}
 	if s1.Get("client_id") != s0.Get("client_id") {
 		t.Fatalf("steps 0 and 1 must use the same IdP client")
@@ -457,14 +469,25 @@ func TestRefreshTokenMode_HappyPath_WithRevocation(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	rev := h.idp.revoked()
-	if len(rev) != 1 || rev[0].Get("token") != h.idp.refreshToken || rev[0].Get("token_type_hint") != "refresh_token" {
-		t.Fatalf("expected the refresh token to be revoked, got %v", rev)
+	if len(rev) != 1 || rev[0].Get("token") != step0AccessToken || rev[0].Get("token_type_hint") != "access_token" {
+		t.Fatalf("expected the unused step-0 access token to be revoked, got %v", rev)
 	}
 }
 
-func TestRefreshTokenMode_AccessTokenSubjectTypeIsConfigurable(t *testing.T) {
+func TestExchangeMode_OpenIDIsAlwaysRequested(t *testing.T) {
 	h := newHarness(t)
-	pol := h.policy(map[string]any{"assertionType": AssertionTypeRefreshToken, "exchangeSubjectTokenType": "access_token"})
+	pol := h.policy(map[string]any{"idTokenSource": IDTokenSourceExchange, "exchangeScopes": "profile email"})
+	req := request(map[string]string{"Authorization": "Bearer " + userAccessToken(time.Now().Add(time.Hour))}, true)
+	mustUpstream(t, pol.OnRequestHeaders(context.Background(), req, nil))
+	step0, _ := h.idp.calls()
+	if got := step0[0].Get("scope"); got != "openid profile email" {
+		t.Fatalf("step 0 scope = %q", got)
+	}
+}
+
+func TestExchangeMode_AccessTokenSubjectTypeIsConfigurable(t *testing.T) {
+	h := newHarness(t)
+	pol := h.policy(map[string]any{"idTokenSource": IDTokenSourceExchange, "exchangeSubjectTokenType": "access_token"})
 	req := request(map[string]string{"Authorization": "Bearer " + userAccessToken(time.Now().Add(time.Hour))}, true)
 	mustUpstream(t, pol.OnRequestHeaders(context.Background(), req, nil))
 	step0, _ := h.idp.calls()
@@ -473,28 +496,50 @@ func TestRefreshTokenMode_AccessTokenSubjectTypeIsConfigurable(t *testing.T) {
 	}
 }
 
-func TestRefreshTokenMode_NoRefreshTokenIsHardFailure(t *testing.T) {
+func TestExchangeMode_NoIDTokenIsHardFailure(t *testing.T) {
 	h := newHarness(t)
-	h.idp.refreshToken = ""
-	pol := h.policy(map[string]any{"assertionType": AssertionTypeRefreshToken})
+	h.idp.idToken = ""
+	pol := h.policy(map[string]any{"idTokenSource": IDTokenSourceExchange})
 	req := request(map[string]string{"Authorization": "Bearer " + userAccessToken(time.Now().Add(time.Hour))}, true)
 
 	mustImmediate(t, pol.OnRequestHeaders(context.Background(), req, nil), http.StatusBadGateway)
 	_, step1 := h.idp.calls()
 	if len(step1) != 0 {
-		t.Fatalf("step 1 must not run without a refresh token")
+		t.Fatalf("step 1 must not run without an ID token")
 	}
 	if len(h.ras.received()) != 0 {
 		t.Fatalf("Resource AS must not be contacted")
 	}
 }
 
-func TestRefreshTokenMode_RevocationFailureDoesNotFailRequest(t *testing.T) {
+func TestExchangeMode_RefreshTokenInStep0IsIgnored(t *testing.T) {
 	h := newHarness(t)
-	h.idp.revocationStatus = 503
-	pol := h.policy(map[string]any{"assertionType": AssertionTypeRefreshToken, "idpRevocationEndpoint": h.idp.srv.URL + "/revoke"})
+	h.idp.step0RefreshTok = "rt-should-never-be-used-0123"
+	pol := h.policy(map[string]any{"idTokenSource": IDTokenSourceExchange})
 	req := request(map[string]string{"Authorization": "Bearer " + userAccessToken(time.Now().Add(time.Hour))}, true)
 	mustUpstream(t, pol.OnRequestHeaders(context.Background(), req, nil))
+	_, step1 := h.idp.calls()
+	if step1[0].Get("subject_token_type") != TokenTypeIDToken || step1[0].Get("subject_token") != h.idp.idToken {
+		t.Fatalf("the assertion must be the ID token even when a refresh token was offered: %v", step1[0])
+	}
+}
+
+func TestExchangeMode_RevocationFailureDoesNotFailRequest(t *testing.T) {
+	h := newHarness(t)
+	h.idp.revocationStatus = 503
+	pol := h.policy(map[string]any{"idTokenSource": IDTokenSourceExchange, "idpRevocationEndpoint": h.idp.srv.URL + "/revoke"})
+	req := request(map[string]string{"Authorization": "Bearer " + userAccessToken(time.Now().Add(time.Hour))}, true)
+	mustUpstream(t, pol.OnRequestHeaders(context.Background(), req, nil))
+}
+
+func TestExchangeMode_MissingAccessTokenIs401(t *testing.T) {
+	h := newHarness(t)
+	pol := h.policy(map[string]any{"idTokenSource": IDTokenSourceExchange})
+	req := request(map[string]string{"X-ID-Token": userIDToken(time.Now().Add(time.Hour))}, true)
+	ir := mustImmediate(t, pol.OnRequestHeaders(context.Background(), req, nil), http.StatusUnauthorized)
+	if !strings.Contains(string(ir.Body), "access token") || !strings.Contains(string(ir.Body), "Authorization") {
+		t.Fatalf("error should name the missing token and header: %s", ir.Body)
+	}
 }
 
 // ─── Tests: inbound validation ────────────────────────────────────────────────
@@ -628,7 +673,7 @@ func TestStep1InvalidGrantIs401WithChallenge(t *testing.T) {
 func TestStep0InvalidGrantIs401(t *testing.T) {
 	h := newHarness(t)
 	h.idp.step0Error = &TokenError{StatusCode: 400, ErrorCode: "invalid_grant", ErrorDescription: "token revoked"}
-	pol := h.policy(map[string]any{"assertionType": AssertionTypeRefreshToken})
+	pol := h.policy(map[string]any{"idTokenSource": IDTokenSourceExchange})
 	req := request(map[string]string{"Authorization": "Bearer " + userAccessToken(time.Now().Add(time.Hour))}, true)
 	mustImmediate(t, pol.OnRequestHeaders(context.Background(), req, nil), http.StatusUnauthorized)
 }
@@ -866,8 +911,8 @@ func TestSecretsAreNotUIParameters(t *testing.T) {
 func TestInvalidParams(t *testing.T) {
 	h := newHarness(t)
 	cases := map[string]map[string]any{
-		"bad assertionType":     {"assertionType": "saml2"},
-		"missing assertionType": {"assertionType": ""},
+		"bad idTokenSource":     {"idTokenSource": "refresh_token"},
+		"missing idTokenSource": {"idTokenSource": ""},
 		"missing audience":      {"audience": ""},
 		"missing idp endpoint":  {"idpTokenEndpoint": ""},
 		"missing ras endpoint":  {"resourceAsTokenEndpoint": ""},
