@@ -45,7 +45,7 @@ and the resulting access token goes upstream.
 
 ---
 
-## 2. Flow and configuration per mode (per assertion type)
+## 2. Flow and configuration per ID token source
 
 ### 2.1 ID token from the client passed as a custom header (`idTokenSource: header`)
 
